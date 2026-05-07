@@ -156,6 +156,8 @@ public:
     virtual void response(const std::vector<int>& input_ids, std::ostream* os = &std::cout, const char* end_with = nullptr, int max_new_tokens = -1);
     void response(const std::string& user_content, std::ostream* os = &std::cout, const char* end_with = nullptr, int max_new_tokens = -1);
     void response(const ChatMessages& chat_prompts, std::ostream* os = &std::cout, const char* end_with = nullptr, int max_new_tokens = -1);
+    void response(const ChatMessages& chat_prompts, const std::string& tools_json,
+                  std::ostream* os = &std::cout, const char* end_with = nullptr, int max_new_tokens = -1);
     void response(MNN::Express::VARP input_embeds, std::ostream* os = &std::cout, const char* end_with = nullptr, int max_new_tokens = -1);
     virtual void generate_init(std::ostream* os = nullptr, const char* end_with = nullptr);
     void generate(int max_token);
@@ -182,6 +184,7 @@ public:
     // ptompt functions
     std::string apply_chat_template(const std::string& user_content) const;
     std::string apply_chat_template(const ChatMessages& chat_prompts) const;
+    std::string apply_chat_template(const ChatMessages& chat_prompts, const std::string& tools_json) const;
     void response(const MultimodalPrompt& multimodal_input,
                   std::ostream* os = &std::cout,
                   const char* end_with = nullptr,

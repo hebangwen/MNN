@@ -907,6 +907,10 @@ std::string Llm::apply_chat_template(const ChatMessages& chat_prompts) const {
     return mTokenizer->apply_chat_template(chat_prompts, true);
 }
 
+std::string Llm::apply_chat_template(const ChatMessages& chat_prompts, const std::string& tools_json) const {
+    return mTokenizer->apply_chat_template(chat_prompts, true, tools_json);
+}
+
 std::vector<int> Llm::tokenizer_encode(const std::string& user_content) {
     return mTokenizer->encode(user_content);
 }
@@ -1132,6 +1136,18 @@ void Llm::response(const ChatMessages& chat_prompts, std::ostream* os, const cha
             mCachedPromptText.clear();
         }
     }
+}
+
+void Llm::response(const ChatMessages& chat_prompts, const std::string& tools_json,
+                  std::ostream* os, const char* end_with, int max_new_tokens) {
+    CHECK_LLM_RUNNING(mContext);
+    MNN::Express::ExecutorScope s(mExecutor);
+    if (chat_prompts.empty()) {
+        return;
+    }
+    auto prompt = apply_chat_template(chat_prompts, tools_json);
+    std::vector<int> input_ids = tokenizer_encode(prompt);
+    response(input_ids, os, end_with, max_new_tokens);
 }
 
 void Llm::updateCachedPromptText(const ChatMessages& chat_prompts, size_t history_before) {

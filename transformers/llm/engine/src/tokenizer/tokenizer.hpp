@@ -151,6 +151,7 @@ public:
     virtual std::string decode(const std::vector<int>& ids);
     // chat template
     std::string apply_chat_template(const ChatMessages& messages, bool add_generation_prompt = true) const;
+    std::string apply_chat_template(const ChatMessages& messages, bool add_generation_prompt, const std::string& tools_json) const;
     std::string apply_chat_template(const std::string& user_content, const std::string& system_prompt = "") const;
     void set_chat_template(const std::string& tpl, const std::string& eos = "", const std::string& context = "");
     const std::string& chat_template() const { return chat_template_; }

@@ -8,7 +8,8 @@
 #include "httplib.h"
 #include "jsonhpp/json.hpp"
 using nlohmann::json;
-using PromptItem = std::pair<std::string, std::string>;
+using namespace MNN::Transformer;
+using PromptItem = ChatMessage;
 namespace mls {
 class LlmStreamBuffer : public std::streambuf {
 public:
@@ -51,7 +52,7 @@ class Utf8StreamProcessor {
       }
     }
     int utf8CharLength(unsigned char byte) {
-      if ((byte & 0x80) == 0) return 1;     
+      if ((byte & 0x80) == 0) return 1;
       if ((byte & 0xE0) == 0xC0) return 2;
       if ((byte & 0xF0) == 0xE0) return 3;
       if ((byte & 0xF8) == 0xF0) return 4;
@@ -61,6 +62,22 @@ class Utf8StreamProcessor {
     std::string utf8Buffer;
     std::function<void(const std::string&)> callback;
   };
+
+// Try to extract tool calls from model output text.
+// Returns json::array() of tool_calls if found, or null if none.
+json ParseToolCallsFromText(const std::string& text);
+
+// Convert an OpenAI-format message JSON to ChatMessage.
+// Handles: plain text messages, tool_calls in assistant messages,
+// tool messages with tool_call_id, content arrays.
+bool MessageToPromptItem(const json& j, PromptItem& item, int& token_count);
+
+// Build an OpenAI-format response message from model output text.
+// Extracts tool_calls if present.
+json BuildResponseMessage(const std::string& answer,
+                          std::string& content_out,
+                          json& tool_calls_out);
+
 class MlsServer {
   public:
     const char* html_content = R"""(
@@ -120,7 +137,7 @@ class MlsServer {
   <button id="reset-btn" class="button" onclick="resetChat()">Reset</button>
 
   <script>
-    const OPENAI_API_KEY = "no";  // put your real key or leave "no" if your server doesn't check it
+    const OPENAI_API_KEY = "no";
     const OPENAI_MODEL = "unknown";
     let messages = [
       { role: "system", content: "You are a helpful assistant." },
@@ -145,14 +162,12 @@ class MlsServer {
       const userInput = document.getElementById("user-input").value.trim();
       if (!userInput) return;
 
-      // Display user message
       displayMessage(userInput, "user");
       document.getElementById("user-input").value = "";
 
       messages.push({ role: "user", content: userInput });
 
       try {
-        // We set "stream": true to indicate we want SSE streaming from our server
         const payload = {
           model: OPENAI_MODEL,
           messages: messages,
@@ -175,7 +190,6 @@ class MlsServer {
           throw new Error(`Error: ${response.status} - ${response.statusText}`);
         }
 
-        // Prepare to stream the response
         await handleStream(response);
 
       } catch (error) {
@@ -184,10 +198,8 @@ class MlsServer {
     }
 
     async function handleStream(response) {
-      // We'll accumulate tokens into this variable
       let assistantMessage = "";
 
-      // Create a DOM element for the assistant's streaming message
       const chatContainer = document.getElementById("chat-container");
       const messageElem = document.createElement("div");
       messageElem.classList.add("message", "assistant");
@@ -196,7 +208,6 @@ class MlsServer {
       chatContainer.scrollTop = chatContainer.scrollHeight;
       const messageTextSpan = messageElem.querySelector("span");
 
-      // Read the response body as a stream
       const reader = response.body.getReader();
       const decoder = new TextDecoder("utf-8");
 
@@ -225,7 +236,6 @@ class MlsServer {
                 const deltaContent = parsed.choices[0].delta.content;
                 if (deltaContent) {
                   assistantMessage += deltaContent;
-                  // Update the DOM text
                   messageTextSpan.textContent = assistantMessage;
                   chatContainer.scrollTop = chatContainer.scrollHeight;
                 }
@@ -260,12 +270,18 @@ class MlsServer {
     )""";
     void Start(MNN::Transformer::Llm* llm, bool is_r1);
     bool is_r1_{false};
+    void Answer(MNN::Transformer::Llm* llm, const json& messages,
+                const std::string& tools_json,
+                std::function<void(const std::string&, int prompt_tokens, int completion_tokens)> on_result);
+    void AnswerStreaming(MNN::Transformer::Llm* llm,
+                       const json& messages,
+                       const std::string& tools_json,
+                       std::function<void(const std::string&, bool end, int prompt_tokens, int completion_tokens)> on_partial);
+    void ApplyRequestParams(MNN::Transformer::Llm* llm, const json& request_json);
+    std::string GetModelName(MNN::Transformer::Llm* llm);
+    int EstimateTokenCount(const std::string& text);
 private:
-  void Answer(MNN::Transformer::Llm* llm, const json &messages, std::function<void(const std::string&)> on_result);
-  void AnswerStreaming(MNN::Transformer::Llm* llm,
-                     const json& messages,
-                     std::function<void(const std::string&, bool end)> on_partial);
     std::mutex llm_mutex_;
-
 };
-}
+
+} // namespace mls
