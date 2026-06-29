@@ -662,8 +662,10 @@ std::vector<int> Omni::unlimitedOcrVisionProcess(VARP image) {
                                 Express::CONSTANT);
 
     // Local tiles: resize the image to (tile_size*wc) x (tile_size*hc), then split into the grid.
+    // HF dynamic_preprocess uses PIL Image.resize() which defaults to BICUBIC; use INTER_CUBIC
+    // to match (INTER_LINEAR produced a ~3.4x upscale that diverged from HF, corrupting OCR).
     auto tiled = MNN::CV::resize(image, {tile_size * wc, tile_size * hc}, 0, 0,
-                                 MNN::CV::INTER_LINEAR, MNN::CV::COLOR_BGR2RGB,
+                                 MNN::CV::INTER_CUBIC, MNN::CV::COLOR_BGR2RGB,
                                  mVisionMean, mVisionNorm);
     tiled = Express::_Unsqueeze(tiled, {0});
     tiled = Express::_Convert(tiled, NCHW);
@@ -684,17 +686,6 @@ std::vector<int> Omni::unlimitedOcrVisionProcess(VARP image) {
     auto imageEmbedding = outputs[0];
     auto dims = imageEmbedding->getInfo()->dim;
     int totalTokens = dims[0];   // 1513 for 3x4
-    {
-        // Dump first/last few values of the vision embedding for cross-check vs Python forward.
-        imageEmbedding->readMap<float>();
-        auto ei = imageEmbedding->getInfo();
-        int n = ei->dim[0];
-        const float* p = imageEmbedding->readMap<float>();
-        std::string first, last;
-        for (int k = 0; k < 5; ++k) first += std::to_string(p[k]) + ",";
-        for (int k = 0; k < 5; ++k) last += std::to_string(p[(n-1)*ei->dim[2] + k]) + ",";
-        fflush(stdout);
-    }
 
     // Omni::embedding consumes ONE mVisionEmbeddings block per contiguous mVisionPad run (it emits
     // the whole block at the first pad of a run, then skips the rest). HF masked_scatter_ is
@@ -926,7 +917,6 @@ std::vector<int> Omni::visionProcess(const std::string& file) {
 
 std::vector<int> Omni::visionProcess(VARP image) {
 #ifdef LLM_SUPPORT_VISION
-    fflush(stdout);
     if (image == nullptr) {
         MNN_PRINT("Omni Can't open image\n");
         return std::vector<int>(0);
@@ -934,7 +924,6 @@ std::vector<int> Omni::visionProcess(VARP image) {
     Timer _t;
     std::vector<int> imgIds;
     const auto inputNames = mVisionModule->getInfo()->inputNames;
-    fflush(stdout);
     if (inputNames.size() >= 3 && inputNames[0] == "patches") {
         imgIds = qwen2VisionProcess(image);
     } else if (inputNames[0] == "pixel_values") {
@@ -1168,9 +1157,23 @@ std::vector<int> Omni::tokenizer_encode(const MultimodalPrompt& multimodal_input
     std::smatch match;
     std::vector<int> ids{};
     mPositionIds.clear();
+    // mTokenizer->encode() prepends prefix_tokens_ (BOS) on every call. Splitting the prompt at
+    // <img>/<audio> boundaries and encoding each text segment separately would inject a BOS per
+    // segment (double-BOS for "<img>...</img>text"). Emit the prefix only once: strip it from
+    // every segment after the first text segment.
+    bool prefix_emitted = false;
+    auto encode_segment = [&](const std::string& segment) -> std::vector<int> {
+        auto seg_ids = mTokenizer->encode(segment);
+        if (prefix_emitted && !seg_ids.empty()) {
+            // strip the leading prefix_tokens_ (BOS) from non-first segments
+            seg_ids.erase(seg_ids.begin());
+        }
+        prefix_emitted = true;
+        return seg_ids;
+    };
 
     while (std::regex_search(searchStart, prompt.cend(), match, multimode_regex)) {
-        auto txt_ids = mTokenizer->encode(match.prefix().str());
+        auto txt_ids = encode_segment(match.prefix().str());
         addPositionIds(txt_ids.size());
         ids.insert(ids.end(), txt_ids.begin(), txt_ids.end());
         std::string mode = match[1].str();
@@ -1178,17 +1181,15 @@ std::vector<int> Omni::tokenizer_encode(const MultimodalPrompt& multimodal_input
         std::vector<int> mul_ids;
         if (mode == "img") {
             mul_ids = processImageContent(content, multimodal_input.images);
-            // MNN_PRINT("tokenizer_encode(MultimodalPrompt) image mul_ids size: %lu", mul_ids.size());
         } else if (mode == "audio") {
             mul_ids = processAudioContent(content, multimodal_input.audios);
-            // MNN_PRINT("tokenizer_encode(MultimodalPrompt) audio mul_ids size: %lu", mul_ids.size());
         }
 
         ids.insert(ids.end(), mul_ids.begin(), mul_ids.end());
         searchStart = match.suffix().first;
     }
     if (searchStart != prompt.cend()) {
-        auto txt_ids = mTokenizer->encode(std::string(searchStart, prompt.cend()));
+        auto txt_ids = encode_segment(std::string(searchStart, prompt.cend()));
         addPositionIds(txt_ids.size());
         ids.insert(ids.end(), txt_ids.begin(), txt_ids.end());
     }
@@ -1315,14 +1316,6 @@ VARP Omni::embedding(const std::vector<int>& input_ids) {
                 deepstacks.push_back(deepstack_embedding);
             }
             auto mul_embedding = mVisionEmbeddings[vision_idx++];
-            if (vision_idx == 1) {
-                auto tInfo = txt_embedding->getInfo();
-                auto mInfo = mul_embedding->getInfo();
-                std::string tDims, mDims;
-                if (tInfo) for (auto d : tInfo->dim) tDims += std::to_string(d) + ",";
-                if (mInfo) for (auto d : mInfo->dim) mDims += std::to_string(d) + ",";
-                fflush(stdout);
-            }
             embeddings.push_back(txt_embedding);
             embeddings.push_back(mul_embedding);
             inVision = true;
@@ -1338,12 +1331,6 @@ VARP Omni::embedding(const std::vector<int>& input_ids) {
         deepstacksTxt();
     }
     auto mergedEmbed = Express::_Concat(embeddings, 0);
-    {
-        auto mi = mergedEmbed->getInfo();
-        std::string md;
-        if (mi) for (auto d : mi->dim) md += std::to_string(d) + ",";
-        fflush(stdout);
-    }
     // Deep copy: materialize the lazy concat so vision data persists after clear
     {
         auto cInfo = mergedEmbed->getInfo();
