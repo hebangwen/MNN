@@ -342,35 +342,72 @@ class UnlimitedOcrVision(Vision):
     def export(self, onnx_path):
         # Export the full forward (SAM+CLIP+projector + per-row image_newline + view_seperator
         # marker assembly) as a single graph taking (patches, image_ori, crop_shape) and emitting
-        # [out_tokens, 1, 1280]. The C++ omni.cpp unlimitedOcrVisionProcess branch tiles the
-        # image, calls this once, and pushes the result to mVisionEmbeddings + emits mVisionPad
-        # token IDs at the image positions. Keeping the marker assembly in the graph avoids
-        # needing the image_newline/view_seperator parameters on the C++ side.
+        # [out_tokens, 1, 1280].
         #
-        # The SAM/CLIP pos-embed resize uses F.interpolate(bicubic, antialias=True) which ONNX
-        # opset 15 cannot trace (aten::_upsample_bicubic2d_aa). It only fires when the input grid
-        # differs from the cached pos-embed (e.g. 640 tiles vs SAM's 1024-native 64x64 grid).
-        # Patch interpolate to antialias=False during tracing — numerically near-identical for
-        # pos-embed grids and only affects the 640-tile path.
+        # The SAM/CLIP pos-embed + rel-pos resize uses F.interpolate(bicubic/linear, antialias=...).
+        # MNN's Resize execution diverges from torch/onnxruntime at bicubic, and the divergence
+        # accumulates through the encoder (corrupting OCR). Eliminate the runtime interpolate
+        # entirely: pre-compute the interpolated pos-embed grids for the FIXED input sizes that
+        # occur at runtime (640 tiles -> SAM tgt 40, CLIP tgt 40; 1024 global -> SAM tgt 64=native,
+        # CLIP tgt 16=native) using the REAL HF F.interpolate(antialias=True) ONCE, cache them, and
+        # patch get_abs_pos_sam / get_abs_pos / get_rel_pos to return the cached constants by
+        # tgt_size. The traced ONNX then has no F.interpolate op.
         import torch.nn.functional as _F
-        _orig_interpolate = _F.interpolate
-        def _trace_interpolate(x, size=None, scale_factor=None, mode=None, align_corners=None, recompute_scale_factor=None, antialias=None):
-            return _orig_interpolate(x, size=size, scale_factor=scale_factor, mode=mode,
-                                     align_corners=align_corners, recompute_scale_factor=recompute_scale_factor,
-                                     antialias=False)
-        _F.interpolate = _trace_interpolate
+        import sys as _sys
+        # The SAM/CLIP modules are loaded via trust_remote_code from the model dir; reach their
+        # defining module (deepencoder) via the class's __module__.
+        _de = _sys.modules[type(self.sam_model).__module__]
+        _orig_get_abs_pos_sam = _de.get_abs_pos_sam
+        _orig_get_abs_pos = _de.get_abs_pos
+        _orig_get_rel_pos = _de.get_rel_pos
+        _sam_cache = {}   # tgt_size -> pre-computed pos_embed
+        _clip_cache = {}  # tgt_size (patch count) -> pre-computed pos_embed
+        _relpos_cache = {}  # (q,k) -> pre-computed rel_pos
+
+        def _cached_get_abs_pos_sam(abs_pos, tgt_size):
+            key = int(tgt_size)
+            if key not in _sam_cache:
+                _sam_cache[key] = _orig_get_abs_pos_sam(abs_pos.detach().clone(), tgt_size).detach()
+            return _sam_cache[key]
+
+        def _cached_get_abs_pos(abs_pos, tgt_size):
+            key = int(tgt_size)
+            if key not in _clip_cache:
+                _clip_cache[key] = _orig_get_abs_pos(abs_pos.detach().clone(), tgt_size).detach()
+            return _clip_cache[key]
+
+        def _cached_get_rel_pos(q_size, k_size, rel_pos):
+            key = (int(q_size), int(k_size))
+            if key not in _relpos_cache:
+                _relpos_cache[key] = _orig_get_rel_pos(q_size, k_size, rel_pos.detach().clone()).detach()
+            return _relpos_cache[key]
+
+        _de.get_abs_pos_sam = _cached_get_abs_pos_sam
+        _de.get_abs_pos = _cached_get_abs_pos
+        _de.get_rel_pos = _cached_get_rel_pos
+        # The SAM/CLIP forward modules reference these as module globals, so patching the module
+        # attribute is enough. (modeling_unlimitedocr imports them via `from .deepencoder import ...`
+        # BUT the SAM forward calls get_abs_pos_sam as a deepencoder-module global — verified.)
         try:
-            P = 12  # example tile count (3x4) for tracing; dynamic on size
+            P = 12  # 3x4 tile count for tracing (matches contract.png)
             patches = torch.randn((P, 3, self.tile_size, self.tile_size), dtype=torch.float32)
             image_ori = torch.randn((1, 3, self.base_size, self.base_size), dtype=torch.float32)
             crop_shape = torch.tensor([3, 4], dtype=torch.long)
+            # Eagerly run forward ONCE to populate the pos-embed / rel-pos caches (the cached
+            # values are computed with the REAL HF F.interpolate(antialias=True), outside tracing).
+            # Then onnx_export traces with the caches already populated -> the patched functions
+            # return constant tensors (cache hits), so NO F.interpolate op is traced.
+            with torch.no_grad():
+                _ = self.forward(patches, image_ori, crop_shape)
             onnx_model = f'{onnx_path}/visual.onnx'
             onnx_export(self, (patches, image_ori, crop_shape),
                         onnx_model,
                         input_names=['unlimited_pixels', 'unlimited_global', 'unlimited_crop'],
                         output_names=['image_embeds'])
         finally:
-            _F.interpolate = _orig_interpolate
+            _de.get_abs_pos_sam = _orig_get_abs_pos_sam
+            _de.get_abs_pos = _orig_get_abs_pos
+            _de.get_rel_pos = _orig_get_rel_pos
         return onnx_model
 
     def embed(self, input_ids, images=None, videos=None):
