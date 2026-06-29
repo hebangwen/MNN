@@ -628,8 +628,14 @@ std::vector<int> Omni::unlimitedOcrVisionProcess(VARP image) {
     const int patch_size = 16, downsample_ratio = 4;
     int nq  = (tile_size / patch_size + downsample_ratio - 1) / downsample_ratio;   // 10
     int nqb = (base_size / patch_size + downsample_ratio - 1) / downsample_ratio;   // 16
-    int img_w = mVisionWidth > 0 ? mVisionWidth : base_size;
-    int img_h = mVisionHeight > 0 ? mVisionHeight : base_size;
+    // Read the actual image dimensions from the VARP (the <img>path</img> path does not set
+    // mVisionWidth/mVisionHeight unless a <hw>H,W</hw> tag is present). CV::imread yields [H,W,C].
+    auto imgInfo = image->getInfo();
+    int img_w = base_size, img_h = base_size;
+    if (imgInfo != nullptr && imgInfo->dim.size() >= 2) {
+        img_h = imgInfo->dim[0];
+        img_w = imgInfo->dim[1];
+    }
 
     // crop ratio (gundam). Small images use a single tile (no local split).
     int wc = 1, hc = 1;
@@ -638,14 +644,22 @@ std::vector<int> Omni::unlimitedOcrVisionProcess(VARP image) {
         wc = cr.first; hc = cr.second;
     }
     int num_tiles = wc * hc;
-
-    // Global view: resize to base_size x base_size (HF uses ImageOps.pad; resize is the MNN
-    // equivalent for the encoder input).
-    auto globalImage = MNN::CV::resize(image, {base_size, base_size}, 0, 0,
+    // Global view: HF uses ImageOps.pad — the ORIGINAL image (no resize) centered in a
+    // base_size x base_size canvas filled with the mean color. Reproduce: normalize the original
+    // image (no resize), then _Pad centered to base_size. After mean/norm, the mean color maps
+    // to 0, so padding with 0 == padding with the mean color.
+    auto globalImage = MNN::CV::resize(image, {img_w, img_h}, 0, 0,
                                        MNN::CV::INTER_LINEAR, MNN::CV::COLOR_BGR2RGB,
                                        mVisionMean, mVisionNorm);
     globalImage = Express::_Unsqueeze(globalImage, {0});
-    globalImage = Express::_Convert(globalImage, NCHW);
+    globalImage = Express::_Convert(globalImage, NCHW);   // [1, 3, img_h, img_w]
+    int pad_top = (base_size - img_h) / 2;
+    int pad_bottom = base_size - img_h - pad_top;
+    int pad_left = (base_size - img_w) / 2;
+    int pad_right = base_size - img_w - pad_left;
+    globalImage = Express::_Pad(globalImage,
+                                _var<int>({0, 0, 0, 0, pad_top, pad_bottom, pad_left, pad_right}, {8}),
+                                Express::CONSTANT);
 
     // Local tiles: resize the image to (tile_size*wc) x (tile_size*hc), then split into the grid.
     auto tiled = MNN::CV::resize(image, {tile_size * wc, tile_size * hc}, 0, 0,
@@ -670,34 +684,35 @@ std::vector<int> Omni::unlimitedOcrVisionProcess(VARP image) {
     auto imageEmbedding = outputs[0];
     auto dims = imageEmbedding->getInfo()->dim;
     int totalTokens = dims[0];   // 1513 for 3x4
+    {
+        // Dump first/last few values of the vision embedding for cross-check vs Python forward.
+        imageEmbedding->readMap<float>();
+        auto ei = imageEmbedding->getInfo();
+        int n = ei->dim[0];
+        const float* p = imageEmbedding->readMap<float>();
+        std::string first, last;
+        for (int k = 0; k < 5; ++k) first += std::to_string(p[k]) + ",";
+        for (int k = 0; k < 5; ++k) last += std::to_string(p[(n-1)*ei->dim[2] + k]) + ",";
+        fflush(stdout);
+    }
 
     // Omni::embedding consumes ONE mVisionEmbeddings block per contiguous mVisionPad run (it emits
-    // the block at the first pad of a run, then skips the rest). HF emits two pad runs:
-    // [global 273][local 1240], and masked_scatter_ is positional: global run <- features[0:273]
-    // (local 0..272), local run <- features[273:1513] (local 273..1239 + global 272 + view_sep 1).
-    // So push two sliced blocks matching the two runs.
+    // the whole block at the first pad of a run, then skips the rest). HF masked_scatter_ is
+    // positional (token i <- feature i), and the vision forward emits features in
+    // [local, global, view_seperator] order = features[0:totalTokens]. Emitting that full block
+    // contiguously at a single pad run reproduces HF's positional scatter exactly. So push ONE
+    // block (the full forward output) and emit `totalTokens` contiguous mVisionPad tokens.
+    mVisionEmbeddings.push_back(imageEmbedding);
+
+    // Emit mVisionPad tokens as one contiguous run of totalTokens (HF infer() tokenized_image:
+    // [global 273][local 1240] = 1513, all the same image_token_id).
     int globalTokenCount = (nqb + 1) * nqb + 1;   // 273
     int localTokenCount = 0;
     if (wc > 1 || hc > 1) {
         localTokenCount = (nq * wc + 1) * (nq * hc);  // 1240
     }
-    // Block for the global run: features[0 : globalTokenCount]
-    auto globalBlock = _Slice(imageEmbedding,
-                              _var<int>({0, 0, 0}, {3}),
-                              _var<int>({globalTokenCount, -1, -1}, {3}));
-    mVisionEmbeddings.push_back(globalBlock);
-    if (localTokenCount > 0) {
-        // Block for the local run: features[globalTokenCount : totalTokens]
-        auto localBlock = _Slice(imageEmbedding,
-                                 _var<int>({globalTokenCount, 0, 0}, {3}),
-                                 _var<int>({localTokenCount, -1, -1}, {3}));
-        mVisionEmbeddings.push_back(localBlock);
-    }
-
-    // Emit mVisionPad tokens as two contiguous runs [global][local] (HF infer() tokenized_image).
     std::vector<int> imgIds;
-    for (int i = 0; i < globalTokenCount; ++i) imgIds.push_back(mVisionPad);
-    for (int i = 0; i < localTokenCount; ++i) imgIds.push_back(mVisionPad);
+    for (int i = 0; i < globalTokenCount + localTokenCount; ++i) imgIds.push_back(mVisionPad);
     // Sanity: emitted token count must equal the vision feature count (the scatter contract).
     if ((int)imgIds.size() != totalTokens) {
         MNN_PRINT("[unlimited-ocr] vision token/embedding count mismatch: tokens=%d embeddings=%d "
@@ -911,6 +926,7 @@ std::vector<int> Omni::visionProcess(const std::string& file) {
 
 std::vector<int> Omni::visionProcess(VARP image) {
 #ifdef LLM_SUPPORT_VISION
+    fflush(stdout);
     if (image == nullptr) {
         MNN_PRINT("Omni Can't open image\n");
         return std::vector<int>(0);
@@ -918,6 +934,7 @@ std::vector<int> Omni::visionProcess(VARP image) {
     Timer _t;
     std::vector<int> imgIds;
     const auto inputNames = mVisionModule->getInfo()->inputNames;
+    fflush(stdout);
     if (inputNames.size() >= 3 && inputNames[0] == "patches") {
         imgIds = qwen2VisionProcess(image);
     } else if (inputNames[0] == "pixel_values") {
@@ -1298,6 +1315,14 @@ VARP Omni::embedding(const std::vector<int>& input_ids) {
                 deepstacks.push_back(deepstack_embedding);
             }
             auto mul_embedding = mVisionEmbeddings[vision_idx++];
+            if (vision_idx == 1) {
+                auto tInfo = txt_embedding->getInfo();
+                auto mInfo = mul_embedding->getInfo();
+                std::string tDims, mDims;
+                if (tInfo) for (auto d : tInfo->dim) tDims += std::to_string(d) + ",";
+                if (mInfo) for (auto d : mInfo->dim) mDims += std::to_string(d) + ",";
+                fflush(stdout);
+            }
             embeddings.push_back(txt_embedding);
             embeddings.push_back(mul_embedding);
             inVision = true;
@@ -1313,6 +1338,12 @@ VARP Omni::embedding(const std::vector<int>& input_ids) {
         deepstacksTxt();
     }
     auto mergedEmbed = Express::_Concat(embeddings, 0);
+    {
+        auto mi = mergedEmbed->getInfo();
+        std::string md;
+        if (mi) for (auto d : mi->dim) md += std::to_string(d) + ",";
+        fflush(stdout);
+    }
     // Deep copy: materialize the lazy concat so vision data persists after clear
     {
         auto cInfo = mergedEmbed->getInfo();

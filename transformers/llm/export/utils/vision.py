@@ -169,10 +169,16 @@ class UnlimitedOcrVision(Vision):
         self.llm_config['image_pad'] = 128815  # <image> token id
         self.llm_config['image_size'] = 1024   # global view size
         self.llm_config['image_max_size'] = 1024
+        # Hard no-repeat-n-gram ban (AC-6): single-image document parsing uses a 35-gram ban
+        # within a sliding window of 128 (HF SlidingWindowNoRepeatNgramProcessor).
+        self.llm_config['no_repeat_ngram_size'] = 35
+        self.llm_config['no_repeat_ngram_window'] = 128
 
     def load(self):
         self.llm_config['is_visual'] = True
         self.llm_config['image_size'] = 1024
+        self.llm_config['no_repeat_ngram_size'] = 35
+        self.llm_config['no_repeat_ngram_window'] = 128
 
     def _encode(self, pixel_values):
         # pixel_values: [B, 3, H, W] (H=W=1024 for global, 640 for a local tile).
