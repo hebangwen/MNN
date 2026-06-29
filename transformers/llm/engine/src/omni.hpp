@@ -166,6 +166,7 @@ public:
     std::vector<int> smolvlmVisionProcess(VARP image);
     std::vector<int> minicpmVisionProcess(VARP image);
     std::vector<int> gemma4VisionProcess(VARP image);
+    std::vector<int> unlimitedOcrVisionProcess(VARP image);
 private:
     int mVisionHeight = 448, mVisionWidth = 448, mVisionStart = 151857,
         mVisionEnd = 151858, mVisionPad = 151859, mAudioPad = 151646,

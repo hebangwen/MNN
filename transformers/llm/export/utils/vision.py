@@ -149,6 +149,14 @@ class UnlimitedOcrVision(Vision):
         self.projector = visual.projector
         self.image_newline = visual.image_newline
         self.view_seperator = visual.view_seperator
+        # gundam tiling constants (HF infer(): base_size=1024 global, image_size=640 tiles)
+        self.base_size = 1024
+        self.tile_size = 640
+        self.patch_size = 16
+        self.downsample_ratio = 4
+        self.image_token_id = 128815  # <image>
+        self.image_pad_id = 128815
+        self.image_embeds = []
 
     def init_config(self):
         self.llm_config['is_visual'] = True
@@ -215,18 +223,164 @@ class UnlimitedOcrVision(Vision):
         global_local_features = global_local_features.unsqueeze(1)
         return global_local_features
 
-    def export(self, onnx_path):
-        # The full export (SAM+CLIP encoder + per-view tiling + marker assembly) is wired up in
-        # task9 together with the C++ omni.cpp vision-injection branch, because the tiled layout
-        # and the image_token_id scatter contract are decided there. AC-4 gates on the Python
-        # forward hook-align, not the ONNX export.
-        raise NotImplementedError(
-            "UnlimitedOcrVision.export is implemented in the C++ integration task (AC-5); "
-            "the Python forward + hook-align (AC-4) do not require it."
-        )
+    @staticmethod
+    def _find_closest_aspect_ratio(aspect_ratio, target_ratios, width, height, image_size):
+        best_ratio_diff = float('inf')
+        best_ratio = (1, 1)
+        area = width * height
+        for ratio in target_ratios:
+            target_aspect_ratio = ratio[0] / ratio[1]
+            ratio_diff = abs(aspect_ratio - target_aspect_ratio)
+            if ratio_diff < best_ratio_diff:
+                best_ratio_diff = ratio_diff
+                best_ratio = ratio
+            elif ratio_diff == best_ratio_diff:
+                if area > 0.5 * image_size * image_size * ratio[0] * ratio[1]:
+                    best_ratio = ratio
+        return best_ratio
 
-    def embed(self, input_ids):
-        return self.embed_(input_ids)
+    def dynamic_preprocess(self, image, min_num=2, max_num=32, image_size=640, use_thumbnail=False):
+        """Gundam 2D tiling: split the image into i x j `image_size` tiles by closest aspect
+        ratio. Mirrors HF modeling_unlimitedocr.dynamic_preprocess."""
+        orig_width, orig_height = image.size
+        aspect_ratio = orig_width / orig_height
+        target_ratios = set(
+            (i, j) for n in range(min_num, max_num + 1)
+            for i in range(1, n + 1) for j in range(1, n + 1)
+            if i * j <= max_num and i * j >= min_num
+        )
+        target_ratios = sorted(target_ratios, key=lambda x: x[0] * x[1])
+        target_ratio = self._find_closest_aspect_ratio(
+            aspect_ratio, target_ratios, orig_width, orig_height, image_size)
+        target_width = image_size * target_ratio[0]
+        target_height = image_size * target_ratio[1]
+        blocks = target_ratio[0] * target_ratio[1]
+        resized_img = image.resize((target_width, target_height))
+        processed_images = []
+        for i in range(blocks):
+            box = (
+                (i % (target_width // image_size)) * image_size,
+                (i // (target_width // image_size)) * image_size,
+                ((i % (target_width // image_size)) + 1) * image_size,
+                ((i // (target_width // image_size)) + 1) * image_size,
+            )
+            processed_images.append(resized_img.crop(box))
+        return processed_images, target_ratio
+
+    def _image_tokens(self, width_crop_num, height_crop_num):
+        """Assemble the <image> placeholder token sequence, matching HF infer() (crop_mode).
+        Layout: [global block][local block] = [global 273][local (nq*wc+1)*(nq*hc)].
+        The vision features (from forward) are [local, global, view_seperator] in that order;
+        embed() scatters them positionally, so the token/feature counts must match (1513)."""
+        nq = math.ceil((self.tile_size // self.patch_size) / self.downsample_ratio)         # 10
+        nqb = math.ceil((self.base_size // self.patch_size) / self.downsample_ratio)        # 16
+        tok = (self.image_token_id, )
+        # global: ([id]*nqb + [id]) * nqb  +  [id]  ->  (16+1)*16 + 1 = 273
+        tokenized_image = ([self.image_token_id] * nqb + [self.image_token_id]) * nqb
+        tokenized_image += [self.image_token_id]
+        # local: ([id]*(nq*wc) + [id]) * (nq*hc)  ->  (10*wc+1)*(10*hc)
+        if width_crop_num > 1 or height_crop_num > 1:
+            tokenized_image += ([self.image_token_id] * (nq * width_crop_num) + [self.image_token_id]) * (nq * height_crop_num)
+        return tokenized_image
+
+    def img_process(self, image):
+        """Tile the image (gundam) + global view, run the vision encoder, store the [1513,1,1280]
+        embedding in self.image_embeds. Returns (token_count, crop_ratio)."""
+        from PIL import ImageOps
+        from torchvision import transforms
+        mean = (0.5, 0.5, 0.5)
+        transform = transforms.Compose([transforms.ToTensor(), transforms.Normalize(mean=mean, std=mean)])
+        if image.size[0] <= self.tile_size and image.size[1] <= self.tile_size:
+            crop_ratio = (1, 1)
+            images_crop_raw = []
+        else:
+            images_crop_raw, crop_ratio = self.dynamic_preprocess(image, image_size=self.tile_size)
+        width_crop_num, height_crop_num = crop_ratio
+        # global view: pad to base_size x base_size
+        global_view = ImageOps.pad(image, (self.base_size, self.base_size),
+                                   color=tuple(int(x * 255) for x in mean))
+        images_list = [transform(global_view).to(self.projector.layers.weight.dtype)]
+        images_crop_list = [transform(c).to(self.projector.layers.weight.dtype) for c in images_crop_raw]
+        patches = torch.stack(images_crop_list, dim=0) if images_crop_list else torch.zeros(
+            (1, 3, self.base_size, self.base_size), dtype=self.projector.layers.weight.dtype)
+        image_ori = torch.stack(images_list, dim=0)
+        features = self.forward(patches, image_ori, torch.tensor([width_crop_num, height_crop_num]))
+        # features: [1513, 1, 1280]; store as a flat [1513, 1, 1280] block (one image)
+        self.image_embeds.append(features)
+        token_count = features.shape[0]
+        assert token_count == len(self._image_tokens(width_crop_num, height_crop_num)), (
+            f"vision feature count {token_count} != image-token count "
+            f"{len(self._image_tokens(width_crop_num, height_crop_num))} (crop {crop_ratio})")
+        return token_count, crop_ratio
+
+    def str_to_ids(self, prompt):
+        """Parse <img>path</img> tags, tile each image, build the token sequence with <image>
+        placeholders, matching HF infer()."""
+        import re
+        text_parts = re.split(r'<img>(.*?)</img>', prompt)
+        txt_prompt = ''
+        img_idx = 0
+        for i, part in enumerate(text_parts):
+            if i % 2 == 0:
+                txt_prompt += part
+            else:
+                # part is the image path
+                from PIL import Image
+                image_obj = Image.open(part).convert('RGB')
+                token_count, crop_ratio = self.img_process(image_obj)
+                txt_prompt += '<image>' * token_count
+                img_idx += 1
+        input_ids = self.tokenizer(txt_prompt, return_tensors="pt", add_special_tokens=False)['input_ids']
+        return input_ids
+
+    def export(self, onnx_path):
+        # Export the full forward (SAM+CLIP+projector + per-row image_newline + view_seperator
+        # marker assembly) as a single graph taking (patches, image_ori, crop_shape) and emitting
+        # [out_tokens, 1, 1280]. The C++ omni.cpp unlimitedOcrVisionProcess branch tiles the
+        # image, calls this once, and pushes the result to mVisionEmbeddings + emits mVisionPad
+        # token IDs at the image positions. Keeping the marker assembly in the graph avoids
+        # needing the image_newline/view_seperator parameters on the C++ side.
+        #
+        # The SAM/CLIP pos-embed resize uses F.interpolate(bicubic, antialias=True) which ONNX
+        # opset 15 cannot trace (aten::_upsample_bicubic2d_aa). It only fires when the input grid
+        # differs from the cached pos-embed (e.g. 640 tiles vs SAM's 1024-native 64x64 grid).
+        # Patch interpolate to antialias=False during tracing — numerically near-identical for
+        # pos-embed grids and only affects the 640-tile path.
+        import torch.nn.functional as _F
+        _orig_interpolate = _F.interpolate
+        def _trace_interpolate(x, size=None, scale_factor=None, mode=None, align_corners=None, recompute_scale_factor=None, antialias=None):
+            return _orig_interpolate(x, size=size, scale_factor=scale_factor, mode=mode,
+                                     align_corners=align_corners, recompute_scale_factor=recompute_scale_factor,
+                                     antialias=False)
+        _F.interpolate = _trace_interpolate
+        try:
+            P = 12  # example tile count (3x4) for tracing; dynamic on size
+            patches = torch.randn((P, 3, self.tile_size, self.tile_size), dtype=torch.float32)
+            image_ori = torch.randn((1, 3, self.base_size, self.base_size), dtype=torch.float32)
+            crop_shape = torch.tensor([3, 4], dtype=torch.long)
+            onnx_model = f'{onnx_path}/visual.onnx'
+            onnx_export(self, (patches, image_ori, crop_shape),
+                        onnx_model,
+                        input_names=['unlimited_pixels', 'unlimited_global', 'unlimited_crop'],
+                        output_names=['image_embeds'])
+        finally:
+            _F.interpolate = _orig_interpolate
+        return onnx_model
+
+    def embed(self, input_ids, images=None, videos=None):
+        input_embeds = self.embed_(input_ids)
+        if self.image_embeds is not None and len(self.image_embeds) > 0:
+            all_embeds = torch.cat(self.image_embeds, dim=0)  # [total_tokens, 1, hidden]
+            all_embeds = all_embeds.reshape(-1, all_embeds.shape[-1]).to(input_embeds.dtype)
+            # MNN embed convention is (seq, batch, hidden); input_ids is (batch, seq).
+            # Squeeze to 2D (seq, hidden) + (seq,) mask for the positional scatter.
+            if input_embeds.dim() == 3:
+                input_embeds = input_embeds.squeeze(1)   # (seq, batch, hidden) -> (seq, hidden)
+            image_mask = (input_ids == self.image_pad_id)
+            if image_mask.dim() > 1:
+                image_mask = image_mask.squeeze(0)       # (batch, seq) -> (seq,)
+            input_embeds[image_mask] = all_embeds
+        return input_embeds
 
 
 class InternVLVision(Vision):

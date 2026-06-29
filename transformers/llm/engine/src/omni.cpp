@@ -589,6 +589,112 @@ std::vector<int> Omni::smolvlmVisionProcess(VARP image) {
     return imgIds;
 }
 
+// Gundam 2D tiling (HF modeling_unlimitedocr.dynamic_preprocess): pick the (i,j) tile grid of
+// `tile_size` squares whose aspect ratio is closest to the image's, with i*j in [min_num, max_num].
+static std::pair<int, int> unlimitedOcrCropRatio(int width, int height, int tile_size,
+                                                  int min_num = 2, int max_num = 32) {
+    float aspect = (float)width / (float)height;
+    int best_w = 1, best_h = 1;
+    float best_diff = 1e9;
+    long area = (long)width * (long)height;
+    for (int n = min_num; n <= max_num; ++n) {
+        for (int i = 1; i <= n; ++i) {
+            for (int j = 1; j <= n; ++j) {
+                if (i * j > max_num || i * j < min_num) continue;
+                float target = (float)i / (float)j;
+                float d = std::abs(aspect - target);
+                if (d < best_diff) {
+                    best_diff = d; best_w = i; best_h = j;
+                } else if (d == best_diff) {
+                    if (area > 0.5f * tile_size * tile_size * i * j) { best_w = i; best_h = j; }
+                }
+            }
+        }
+    }
+    return {best_w, best_h};
+}
+
+std::vector<int> Omni::unlimitedOcrVisionProcess(VARP image) {
+    // baidu/Unlimited-OCR gundam tiling + vision injection. Mirrors HF infer() + forward():
+    // tile the image into width_crop x height_crop 640x640 local tiles + a 1024x1024 global
+    // view, run the exported vision forward (SAM+CLIP+projector + image_newline/view_seperator
+    // marker assembly) once, push the per-token embeddings to mVisionEmbeddings in
+    // [local, global, view_seperator] order, and emit mVisionPad tokens in [global, local]
+    // order. Omni::embedding scatters mVisionEmbeddings positionally at mVisionPad positions,
+    // reproducing HF masked_scatter_.
+    MNN::Express::ExecutorScope s(mExecutor);
+    const int base_size = 1024;   // global view
+    const int tile_size = 640;    // local tile
+    const int patch_size = 16, downsample_ratio = 4;
+    int nq  = (tile_size / patch_size + downsample_ratio - 1) / downsample_ratio;   // 10
+    int nqb = (base_size / patch_size + downsample_ratio - 1) / downsample_ratio;   // 16
+    int img_w = mVisionWidth > 0 ? mVisionWidth : base_size;
+    int img_h = mVisionHeight > 0 ? mVisionHeight : base_size;
+
+    // crop ratio (gundam). Small images use a single tile (no local split).
+    int wc = 1, hc = 1;
+    if (img_w > tile_size || img_h > tile_size) {
+        auto cr = unlimitedOcrCropRatio(img_w, img_h, tile_size);
+        wc = cr.first; hc = cr.second;
+    }
+    int num_tiles = wc * hc;
+
+    // Global view: resize to base_size x base_size (HF uses ImageOps.pad; resize is the MNN
+    // equivalent for the encoder input).
+    auto globalImage = MNN::CV::resize(image, {base_size, base_size}, 0, 0,
+                                       MNN::CV::INTER_LINEAR, MNN::CV::COLOR_BGR2RGB,
+                                       mVisionMean, mVisionNorm);
+    globalImage = Express::_Unsqueeze(globalImage, {0});
+    globalImage = Express::_Convert(globalImage, NCHW);
+
+    // Local tiles: resize the image to (tile_size*wc) x (tile_size*hc), then split into the grid.
+    auto tiled = MNN::CV::resize(image, {tile_size * wc, tile_size * hc}, 0, 0,
+                                 MNN::CV::INTER_LINEAR, MNN::CV::COLOR_BGR2RGB,
+                                 mVisionMean, mVisionNorm);
+    tiled = Express::_Unsqueeze(tiled, {0});
+    tiled = Express::_Convert(tiled, NCHW);
+    // [1, 3, tile*hc, tile*wc] -> [num_tiles, 3, tile, tile]
+    tiled = Express::_Reshape(tiled, {1, 3, hc, tile_size, wc, tile_size});
+    tiled = Express::_Permute(tiled, {0, 2, 4, 1, 3, 5});
+    tiled = Express::_Reshape(tiled, {num_tiles, 3, tile_size, tile_size});
+
+    // crop_shape input
+    auto cropShape = _Input({2}, NCHW, halide_type_of<int>());
+    auto cropPtr = cropShape->writeMap<int>();
+    cropPtr[0] = wc; cropPtr[1] = hc;
+    cropShape->unMap();
+
+    // Forward the exported vision module: [num_tiles,3,640,640], [1,3,1024,1024], [2] -> [1513,1,1280]
+    auto outputs = mVisionModule->onForward({tiled, globalImage, cropShape});
+    auto imageEmbedding = outputs[0];
+    auto dims = imageEmbedding->getInfo()->dim;
+    int totalTokens = dims[0];   // 1513 for 3x4
+    // Push per-token embeddings to mVisionEmbeddings (in forward's [local,global,view_sep] order).
+    for (int i = 0; i < totalTokens; ++i) {
+        auto idx = _var<int>({i}, {1});
+        auto axis = _var<int>({0}, {1});
+        auto tok = _Squeeze(_GatherV2(imageEmbedding, idx, axis), {0});
+        mVisionEmbeddings.push_back(tok);
+    }
+
+    // Emit mVisionPad tokens in [global block, local block] order (HF infer() tokenized_image).
+    std::vector<int> imgIds;
+    int globalTokenCount = (nqb + 1) * nqb + 1;   // 273
+    int localTokenCount = 0;
+    if (wc > 1 || hc > 1) {
+        localTokenCount = (nq * wc + 1) * (nq * hc);  // 1240
+    }
+    for (int i = 0; i < globalTokenCount + localTokenCount; ++i) {
+        imgIds.push_back(mVisionPad);
+    }
+    // Sanity: the emitted token count must equal the pushed embedding count (the scatter contract).
+    if ((int)imgIds.size() != totalTokens) {
+        MNN_PRINT("[unlimited-ocr] vision token/embedding count mismatch: tokens=%d embeddings=%d "
+                  "(crop %dx%d)\n", (int)imgIds.size(), totalTokens, wc, hc);
+    }
+    return imgIds;
+}
+
 std::vector<std::pair<int, int>> minicpmBestSize(std::pair<int, int> original_size, int patch_size) {
     constexpr int max_slice_nums = 9, scale_resolution = 448;
     auto _get_target_size =
@@ -811,6 +917,8 @@ std::vector<int> Omni::visionProcess(VARP image) {
         }
     } else if (inputNames.size() >= 2 && inputNames[0] == "input_patches") {
         imgIds = gemma4VisionProcess(image);
+    } else if (inputNames.size() >= 1 && inputNames[0] == "unlimited_pixels") {
+        imgIds = unlimitedOcrVisionProcess(image);
     } else {
         imgIds = defaultVisionProcess(image);
     }
