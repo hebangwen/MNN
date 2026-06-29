@@ -1102,6 +1102,13 @@ class Mlp(torch.nn.Module):
             self.experts = new_experts_list
             del self.router
 
+        # DeepSeek-V2 style MoE (e.g. baidu/Unlimited-OCR): the gate is a MoEGate that returns
+        # a pre-computed (topk_idx, topk_weight, aux_loss) tuple (softmax + greedy topk +
+        # routed_scaling_factor already applied internally), and the N shared experts are fused
+        # into one wide MLP exposed as `shared_experts` (plural, no shared_expert_gate).
+        if hasattr(self, 'shared_experts'):
+            self.moe_type = 'deepseek_v2_moe'
+
     def forward(self, hidden_states: torch.Tensor):
         if not self.is_moe:
             # general Mlp
@@ -1110,13 +1117,24 @@ class Mlp(torch.nn.Module):
         # MoE Mlp
         batch_size, sequence_length, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
-        if hasattr(self, 'shared_expert'):
+        if hasattr(self, 'shared_experts'):
+            # DeepSeek-V2: the N shared experts are fused into one wide MLP (no gate, no sigmoid);
+            # added unconditionally, matching HF `y = y + self.shared_experts(identity)`.
+            shared_expert_output = self.shared_experts(hidden_states)
+            shared_expert_output = shared_expert_output.reshape(batch_size, sequence_length, hidden_dim)
+        elif hasattr(self, 'shared_expert'):
             shared_expert_output = F.sigmoid(self.shared_expert_gate(hidden_states)) * self.shared_expert(hidden_states)
             shared_expert_output = shared_expert_output.reshape(batch_size, sequence_length, hidden_dim)
         else:
             shared_expert_output = None
 
-        if self.moe_type == 'lfm2_moe':
+        if self.moe_type == 'deepseek_v2_moe':
+            # The gate is a MoEGate returning a pre-computed (topk_idx, topk_weight, aux_loss)
+            # tuple; routing weights are already softmax + greedy-topk + routed_scaling_factor.
+            topk_idx, topk_weight, _ = self.gate(hidden_states.reshape(batch_size, sequence_length, hidden_dim))
+            routing_weights = topk_weight.to(hidden_states.dtype)
+            selected_experts = topk_idx
+        elif self.moe_type == 'lfm2_moe':
             router_logits = self.gate(hidden_states)
             routing_weights = router_logits.sigmoid()
             scores_for_routing = routing_weights + self.expert_bias
