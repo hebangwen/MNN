@@ -76,6 +76,48 @@ class ModelMapper:
         }
         self.regist('deepseek-vl', deepseek_vlmap)
 
+    def regist_unlimited_ocr(self):
+        # baidu/Unlimited-OCR: DeepSeek-V2 MoE (non-MLA MHA) + SAM/CLIP vision + linear projector.
+        # UnlimitedOCRConfig flattens the DeepSeek text fields to the top level (language_config is
+        # a plain dict, not a nested config), so config fields are read directly from the top level.
+        # head_dim is absent from config and derived as hidden_size // num_attention_heads (=128).
+        # The 2 shared experts are fused into one wide MLP (intermediate = moe_intermediate_size *
+        # n_shared_experts) exposed as `shared_experts` (plural); there is no shared_expert_gate.
+        unlimited_ocr_config = {
+            'hidden_size': 'hidden_size',
+            'num_attention_heads': 'num_attention_heads',
+            'num_hidden_layers': 'num_hidden_layers',
+            'num_key_value_heads': 'num_key_value_heads',
+            'rope_theta': 'rope_theta',
+            'rope_scaling': 'rope_scaling',
+            'max_position_embeddings': 'max_position_embeddings',
+            'sliding_window': 'sliding_window',
+            'rms_norm_eps': 'rms_norm_eps',
+        }
+        unlimited_ocr_model = {
+            'lm': 'lm_head',
+            'embed': 'model.embed_tokens',
+            'blocks': 'model.layers',
+            'final_layernorm': 'model.norm',
+            'visual': 'model',
+        }
+        unlimited_ocr_mlp = {
+            'num_experts': 'gate.n_routed_experts',
+            'top_k': 'gate.top_k',
+            'norm_topk_prob': 'gate.norm_topk_prob',
+            'gate': 'gate',
+            'experts': 'experts',
+            'shared_experts': 'shared_experts',
+        }
+        unlimited_ocr_map = {
+            'config': unlimited_ocr_config,
+            'model': unlimited_ocr_model,
+            'decoder': self.default_decoder,
+            'attention': self.default_attention,
+            'mlp': unlimited_ocr_mlp,
+        }
+        self.regist('unlimited-ocr', unlimited_ocr_map)
+
     def regist_qwen_omni(self):
         omni_map = {
             'config': {
