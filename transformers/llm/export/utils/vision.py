@@ -35,6 +35,7 @@ class Vision(torch.nn.Module):
     def get_vision(model_type):
         visual_models = {
             'deepseek-vl': DeepSeekVL,
+            'unlimited-ocr': UnlimitedOcrVision,
             'internvl_chat': InternVLVision,
             'qwen': QwenVision,
             'qwen2_vl': Qwen2Vision,
@@ -126,6 +127,106 @@ class DeepSeekVL(Vision):
         # For mnn's embedding, the order is (seq, batch, hidden)
         vit_embeds = vit_embeds.permute(1, 0, 2)
         return vit_embeds
+
+
+class UnlimitedOcrVision(Vision):
+    """Vision encoder for baidu/Unlimited-OCR (deeplip_b_l).
+
+    Reproduces the HF ``UnlimitedOCRModel.forward`` vision branch: SAM ViT-B features
+    condition CLIP ViT-L (CLIP uses the SAM features as its patch embeddings), the two are
+    concatenated to 2048-dim, a linear projector maps 2048->1280, and per-row
+    ``image_newline`` markers + a ``view_seperator`` are inserted. The output is the
+    global+local feature sequence ``[out_tokens, 1, 1280]`` (the C++ side injects it at the
+    ``image_token_id`` positions, the analog of HF ``masked_scatter_``).
+    """
+    def __init__(self, visual, base):
+        # `visual` is the UnlimitedOCRModel, which owns sam_model / vision_model /
+        # projector / image_newline / view_seperator.
+        super().__init__(visual, base)
+        self.quant_bit = 8
+        self.sam_model = visual.sam_model
+        self.vision_model = visual.vision_model
+        self.projector = visual.projector
+        self.image_newline = visual.image_newline
+        self.view_seperator = visual.view_seperator
+
+    def init_config(self):
+        self.llm_config['is_visual'] = True
+        # HF BasicImageTransform uses mean=std=(0.5,0.5,0.5) with ToTensor (0..1) + Normalize.
+        # MNN's C++ pipeline works in 0..255, so scale accordingly.
+        mean = [0.5 * 255.0, 0.5 * 255.0, 0.5 * 255.0]
+        std = [1.0 / 0.5 / 255.0, 1.0 / 0.5 / 255.0, 1.0 / 0.5 / 255.0]
+        self.llm_config['image_mean'] = mean
+        self.llm_config['image_norm'] = std
+        self.llm_config['image_pad'] = 128815  # <image> token id
+        self.llm_config['image_size'] = 1024   # global view size
+        self.llm_config['image_max_size'] = 1024
+
+    def load(self):
+        self.llm_config['is_visual'] = True
+        self.llm_config['image_size'] = 1024
+
+    def _encode(self, pixel_values):
+        # pixel_values: [B, 3, H, W] (H=W=1024 for global, 640 for a local tile).
+        # SAM features condition CLIP; concat (CLIP[:,1:], SAM flatten) -> 2048 -> projector -> 1280.
+        sam_features = self.sam_model(pixel_values)
+        clip_features = self.vision_model(pixel_values, sam_features)
+        features = torch.cat(
+            (clip_features[:, 1:], sam_features.flatten(2).permute(0, 2, 1)), dim=-1
+        )
+        features = self.projector(features)
+        return features
+
+    def forward(self, patches, image_ori, crop_shape):
+        # patches: [P, 3, 640, 640] local tiles (P = width_crop_num * height_crop_num)
+        # image_ori: [1, 3, 1024, 1024] global view
+        # crop_shape: [width_crop_num, height_crop_num]
+        width_crop_num, height_crop_num = int(crop_shape[0]), int(crop_shape[1])
+
+        local_features = self._encode(patches)        # [P, N_local, 1280]
+        global_features = self._encode(image_ori)     # [1, N_global, 1280]
+
+        _, hw, n_dim = global_features.shape
+        h = w = int(hw ** 0.5)
+        _2, hw2, n_dim2 = local_features.shape
+        h2 = w2 = int(hw2 ** 0.5)
+
+        # global: [h, w, n_dim] + image_newline per row -> [h, w+1, n_dim] -> [h*(w+1), n_dim]
+        global_features = global_features.view(h, w, n_dim)
+        global_features = torch.cat(
+            [global_features, self.image_newline[None, None, :].expand(h, 1, n_dim)], dim=1
+        )
+        global_features = global_features.view(-1, n_dim)
+
+        # local: reassemble tiles into a grid [hc*h2, wc*w2, n_dim2] + image_newline per row
+        local_features = local_features.view(
+            height_crop_num, width_crop_num, h2, w2, n_dim2
+        ).permute(0, 2, 1, 3, 4).reshape(height_crop_num * h2, width_crop_num * w2, n_dim2)
+        local_features = torch.cat(
+            [local_features, self.image_newline[None, None, :].expand(height_crop_num * h2, 1, n_dim2)],
+            dim=1,
+        )
+        local_features = local_features.view(-1, n_dim2)
+
+        global_local_features = torch.cat(
+            [local_features, global_features, self.view_seperator[None, :]], dim=0
+        )
+        # MNN convention: (seq, batch, hidden)
+        global_local_features = global_local_features.unsqueeze(1)
+        return global_local_features
+
+    def export(self, onnx_path):
+        # The full export (SAM+CLIP encoder + per-view tiling + marker assembly) is wired up in
+        # task9 together with the C++ omni.cpp vision-injection branch, because the tiled layout
+        # and the image_token_id scatter contract are decided there. AC-4 gates on the Python
+        # forward hook-align, not the ONNX export.
+        raise NotImplementedError(
+            "UnlimitedOcrVision.export is implemented in the C++ integration task (AC-5); "
+            "the Python forward + hook-align (AC-4) do not require it."
+        )
+
+    def embed(self, input_ids):
+        return self.embed_(input_ids)
 
 
 class InternVLVision(Vision):
