@@ -665,29 +665,40 @@ std::vector<int> Omni::unlimitedOcrVisionProcess(VARP image) {
     cropShape->unMap();
 
     // Forward the exported vision module: [num_tiles,3,640,640], [1,3,1024,1024], [2] -> [1513,1,1280]
+    // The output is in HF forward() order: [local 1240, global 272, view_seperator 1] = 1513.
     auto outputs = mVisionModule->onForward({tiled, globalImage, cropShape});
     auto imageEmbedding = outputs[0];
     auto dims = imageEmbedding->getInfo()->dim;
     int totalTokens = dims[0];   // 1513 for 3x4
-    // Push per-token embeddings to mVisionEmbeddings (in forward's [local,global,view_sep] order).
-    for (int i = 0; i < totalTokens; ++i) {
-        auto idx = _var<int>({i}, {1});
-        auto axis = _var<int>({0}, {1});
-        auto tok = _Squeeze(_GatherV2(imageEmbedding, idx, axis), {0});
-        mVisionEmbeddings.push_back(tok);
-    }
 
-    // Emit mVisionPad tokens in [global block, local block] order (HF infer() tokenized_image).
-    std::vector<int> imgIds;
+    // Omni::embedding consumes ONE mVisionEmbeddings block per contiguous mVisionPad run (it emits
+    // the block at the first pad of a run, then skips the rest). HF emits two pad runs:
+    // [global 273][local 1240], and masked_scatter_ is positional: global run <- features[0:273]
+    // (local 0..272), local run <- features[273:1513] (local 273..1239 + global 272 + view_sep 1).
+    // So push two sliced blocks matching the two runs.
     int globalTokenCount = (nqb + 1) * nqb + 1;   // 273
     int localTokenCount = 0;
     if (wc > 1 || hc > 1) {
         localTokenCount = (nq * wc + 1) * (nq * hc);  // 1240
     }
-    for (int i = 0; i < globalTokenCount + localTokenCount; ++i) {
-        imgIds.push_back(mVisionPad);
+    // Block for the global run: features[0 : globalTokenCount]
+    auto globalBlock = _Slice(imageEmbedding,
+                              _var<int>({0, 0, 0}, {3}),
+                              _var<int>({globalTokenCount, -1, -1}, {3}));
+    mVisionEmbeddings.push_back(globalBlock);
+    if (localTokenCount > 0) {
+        // Block for the local run: features[globalTokenCount : totalTokens]
+        auto localBlock = _Slice(imageEmbedding,
+                                 _var<int>({globalTokenCount, 0, 0}, {3}),
+                                 _var<int>({localTokenCount, -1, -1}, {3}));
+        mVisionEmbeddings.push_back(localBlock);
     }
-    // Sanity: the emitted token count must equal the pushed embedding count (the scatter contract).
+
+    // Emit mVisionPad tokens as two contiguous runs [global][local] (HF infer() tokenized_image).
+    std::vector<int> imgIds;
+    for (int i = 0; i < globalTokenCount; ++i) imgIds.push_back(mVisionPad);
+    for (int i = 0; i < localTokenCount; ++i) imgIds.push_back(mVisionPad);
+    // Sanity: emitted token count must equal the vision feature count (the scatter contract).
     if ((int)imgIds.size() != totalTokens) {
         MNN_PRINT("[unlimited-ocr] vision token/embedding count mismatch: tokens=%d embeddings=%d "
                   "(crop %dx%d)\n", (int)imgIds.size(), totalTokens, wc, hc);
