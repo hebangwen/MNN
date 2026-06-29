@@ -164,6 +164,10 @@ Sampler::Sampler(std::shared_ptr<LlmContext> context, std::shared_ptr<LlmConfig>
     mConfig.max_new_tokens = config->max_new_tokens();
     mConfig.type = config->sampler_type();
     mConfig.configSampler(mConfig.type, config);
+    // Hard no-repeat-n-gram ban applies regardless of sampler type (greedy included).
+    mConfig.no_repeat_ngram_size = config->no_repeat_ngram_size();
+    mConfig.no_repeat_ngram_window = config->no_repeat_ngram_window();
+    mConfig.no_repeat_ngram_whitelist = config->no_repeat_ngram_whitelist();
     buildPipeline();
 }
 
@@ -211,6 +215,11 @@ void Sampler::buildPipeline() {
     } else {
         // single sampler type
         addStep(mConfig.type);
+    }
+    // Hard no-repeat-n-gram ban runs for every sampler type (greedy included), right before
+    // the final select. It writes -inf on tokens that would complete a seen n-gram.
+    if (mConfig.no_repeat_ngram_size > 0) {
+        mPipeline.push_back([this](SamplerState& s) { stepNoRepeatNgram(s); });
     }
     // final select step
     mPipeline.push_back([this](SamplerState& s) { stepSelect(s); });
@@ -510,6 +519,71 @@ void Sampler::stepBannedTokens(SamplerState& state) {
         }
     }
     state.invalidateProbs();
+}
+
+void Sampler::stepNoRepeatNgram(SamplerState& state) {
+    // Hard no-repeat-n-gram ban, matching HF SlidingWindowNoRepeatNgramProcessor:
+    // scan the generated history in [max(0,len-window), len-ngram_size+1); for each n-gram whose
+    // first (n-1) tokens equal the trailing (n-1)-prefix, ban its completing token (-inf),
+    // whitelist-exempt. No-op if history shorter than ngram_size or the window is empty.
+    int ngram_size = mConfig.no_repeat_ngram_size;
+    if (ngram_size <= 0) return;
+    int window = mConfig.no_repeat_ngram_window;
+
+    const std::vector<int>& prev = mContext->history_tokens;
+    int len = (int)prev.size();
+    if (len < ngram_size) return;
+
+    // Match HF SlidingWindowNoRepeatNgramProcessor: search_start = max(0, len - window).
+    // window <= 0 yields search_start >= len -> empty range -> no-op (the disabled case;
+    // the accessor defaults to 0).
+    int search_start = std::max(0, len - window);
+    int search_end = len - ngram_size + 1;
+    if (search_end <= search_start) return;
+
+    // Trailing (n-1)-prefix that a completing token would extend.
+    int prefix_len = ngram_size - 1;
+    // Whitelist lookup.
+    std::unordered_map<int, bool> whitelist;
+    for (int t : mConfig.no_repeat_ngram_whitelist) whitelist[t] = true;
+
+    const float NEG_INF = -std::numeric_limits<float>::infinity();
+    bool banned_any = false;
+    // Collect banned token ids (dedup via a set), then apply.
+    std::unordered_map<int, bool> banned;
+    for (int idx = search_start; idx < search_end; ++idx) {
+        // n-1 prefix of this candidate n-gram must match the trailing prefix.
+        bool match = true;
+        if (prefix_len > 0) {
+            for (int k = 0; k < prefix_len; ++k) {
+                if (prev[idx + k] != prev[len - prefix_len + k]) { match = false; break; }
+            }
+        }
+        if (!match) continue;
+        int completing = prev[idx + prefix_len];
+        if (whitelist.count(completing)) continue;
+        banned[completing] = true;
+    }
+    if (banned.empty()) return;
+
+    if (state.is_subset) {
+        auto indexMap = buildIndexMap(state);
+        for (auto& kv : banned) {
+            auto it = indexMap.find(kv.first);
+            if (it != indexMap.end()) {
+                state.logits[it->second] = NEG_INF;
+                banned_any = true;
+            }
+        }
+    } else {
+        for (auto& kv : banned) {
+            if (kv.first >= 0 && kv.first < (int)state.logits.size()) {
+                state.logits[kv.first] = NEG_INF;
+                banned_any = true;
+            }
+        }
+    }
+    if (banned_any) state.invalidateProbs();
 }
 
 void Sampler::stepSelect(SamplerState& state) {

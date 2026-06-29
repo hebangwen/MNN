@@ -55,6 +55,10 @@ public:
         // logit bias and banned tokens
         std::unordered_map<int, float> logit_bias;
         std::vector<int> banned_tokens;
+        // Hard no-repeat-n-gram ban (writes -inf; whitelist-exempt). 0 = disabled.
+        int no_repeat_ngram_size = 0;
+        int no_repeat_ngram_window = 0;
+        std::vector<int> no_repeat_ngram_whitelist;
         void configSampler(std::string sampler_type, std::shared_ptr<LlmConfig> llmConfig);
         void configGreedy(std::shared_ptr<LlmConfig> llmConfig);
         void configTemperature(std::shared_ptr<LlmConfig> llmConfig);
@@ -88,6 +92,7 @@ private:
     void stepTypical(SamplerState& state);
     void stepLogitBias(SamplerState& state);
     void stepBannedTokens(SamplerState& state);
+    void stepNoRepeatNgram(SamplerState& state);
     void stepSelect(SamplerState& state);
 };
 

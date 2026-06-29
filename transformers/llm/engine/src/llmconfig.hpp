@@ -527,6 +527,19 @@ public:
     std::vector<int> banned_tokens() const {
         return config_.value("banned_tokens", std::vector<int>{});
     }
+
+    // Hard no-repeat-n-gram ban (e.g. baidu/Unlimited-OCR DeepseekOCRNoRepeatNGramLogitProcessor).
+    // When no_repeat_ngram_size > 0, the sampler sets -inf on any candidate token that would
+    // complete a seen n-gram within the sliding window, whitelist-exempt. 0 = disabled.
+    int no_repeat_ngram_size() const {
+        return config_.value("no_repeat_ngram_size", 0);
+    }
+    int no_repeat_ngram_window() const {
+        return config_.value("no_repeat_ngram_window", 0);
+    }
+    std::vector<int> no_repeat_ngram_whitelist() const {
+        return config_.value("no_repeat_ngram_whitelist", std::vector<int>{});
+    }
     // sampler config end >
 
     // < speculative decoding config start
