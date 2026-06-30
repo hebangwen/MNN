@@ -682,10 +682,41 @@ std::vector<int> Omni::unlimitedOcrVisionProcess(VARP image) {
 
     // Forward the exported vision module: [num_tiles,3,640,640], [1,3,1024,1024], [2] -> [1513,1,1280]
     // The output is in HF forward() order: [local 1240, global 272, view_seperator 1] = 1513.
-    auto outputs = mVisionModule->onForward({tiled, globalImage, cropShape});
-    auto imageEmbedding = outputs[0];
-    auto dims = imageEmbedding->getInfo()->dim;
-    int totalTokens = dims[0];   // 1513 for 3x4
+    VARP imageEmbedding;
+    int totalTokens;
+    // Debug isolation path: if UOCR_INJECT_VISION env var is set, load pre-computed correct vision
+    // features from that file (computed via onnxruntime) instead of running MNN vision forward.
+    // This isolates whether the garbage e2e output is from MNN vision execution or the LLM w4.
+    const char* injectPath = std::getenv("UOCR_INJECT_VISION");
+    if (injectPath != nullptr) {
+        MNN_PRINT("[uocr] INJECT MODE: loading pre-computed vision features from %s\n", injectPath);
+        fflush(stdout);
+        // Read the binary file: [1513, 1, 1280] float32
+        FILE* fp = std::fopen(injectPath, "rb");
+        if (fp == nullptr) {
+            MNN_PRINT("[uocr] INJECT MODE: cannot open %s, falling back to MNN vision\n", injectPath);
+        } else {
+            std::fseek(fp, 0, SEEK_END);
+            long fsize = std::ftell(fp);
+            std::fseek(fp, 0, SEEK_SET);
+            int numTokens = (int)(fsize / (sizeof(float) * 1280));
+            MNN_PRINT("[uocr] INJECT MODE: %d tokens, %ld bytes\n", numTokens, fsize);
+            auto injected = _Input({numTokens, 1, 1280}, NCHW, halide_type_of<float>());
+            auto ptr = injected->writeMap<float>();
+            size_t read = std::fread(ptr, sizeof(float), fsize / sizeof(float), fp);
+            std::fclose(fp);
+            injected->unMap();
+            MNN_PRINT("[uocr] INJECT MODE: loaded %zu floats\n", read);
+            imageEmbedding = injected;
+            totalTokens = numTokens;
+        }
+    }
+    if (imageEmbedding == nullptr) {
+        auto outputs = mVisionModule->onForward({tiled, globalImage, cropShape});
+        imageEmbedding = outputs[0];
+        auto dims = imageEmbedding->getInfo()->dim;
+        totalTokens = dims[0];   // 1513 for 3x4
+    }
 
     // Omni::embedding consumes ONE mVisionEmbeddings block per contiguous mVisionPad run (it emits
     // the whole block at the first pad of a run, then skips the rest). HF masked_scatter_ is
