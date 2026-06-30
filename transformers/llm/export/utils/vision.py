@@ -377,7 +377,10 @@ class UnlimitedOcrVision(Vision):
             return _clip_cache[key]
 
         def _cached_get_rel_pos(q_size, k_size, rel_pos):
-            key = (int(q_size), int(k_size))
+            # SAM ViT-B has 12 attention blocks, each with UNIQUE rel_pos_h/rel_pos_w learned
+            # parameters that share the same (q_size, k_size). The cache key MUST distinguish
+            # per-block rel_pos tensors (by id), else block 0's rel_pos is reused for all blocks.
+            key = (int(q_size), int(k_size), id(rel_pos))
             if key not in _relpos_cache:
                 _relpos_cache[key] = _orig_get_rel_pos(q_size, k_size, rel_pos.detach().clone()).detach()
             return _relpos_cache[key]
