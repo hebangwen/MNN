@@ -430,6 +430,11 @@ class LlmExporter(torch.nn.Module):
                     for name, child in self.model.blocks[i].mlp.shared_expert.named_children():
                         if isinstance(child, torch.nn.Linear):
                             setattr(self.model.blocks[i].mlp.shared_expert, name, build_faker(child, f'/layers.{i}/mlp/shared_expert/{name}/Linear'))
+                # shared_experts (plural, e.g. DeepSeek-V2 fused shared experts) in MLP-level MoE
+                if is_moe and hasattr(self.model.blocks[i].mlp, 'shared_experts'):
+                    for name, child in self.model.blocks[i].mlp.shared_experts.named_children():
+                        if isinstance(child, torch.nn.Linear):
+                            setattr(self.model.blocks[i].mlp.shared_experts, name, build_faker(child, f'/layers.{i}/mlp/shared_experts/{name}/Linear'))
                 # MLP-level MoE experts
                 if is_moe and hasattr(self.model.blocks[i].mlp, 'experts') and isinstance(self.model.blocks[i].mlp.experts, torch.nn.ModuleList):
                     self.experts.append(self.model.blocks[i].mlp.experts)
