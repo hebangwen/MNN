@@ -67,7 +67,12 @@ def convert(args):
     mnn_dir = args.mnn_dir
     src_json = os.path.join(mnn_dir, "llm.mnn.json")
     dst_json = os.path.join(mnn_dir, "llm.mnn_new.json")
-    mnn, opmap, convs, blockes, last = load_mnn(src_json)
+    result = load_mnn(src_json)
+    if len(result) == 6:
+        mnn, opmap, convs, blockes, last, gate_convs = result
+    else:
+        mnn, opmap, convs, blockes, last = result
+        gate_convs = []
     output_norm = last.attn_norm
     lm = last.conv[0]
     asym = not args.sym
@@ -96,6 +101,15 @@ def convert(args):
                             continue
                         if k.find("post_attention_layernorm") >= 0:
                             load_layernorm(block.layernorm[1], k, f)
+                            continue
+                        # MoE gate weight (e.g. DeepSeek-V2 MoEGate)
+                        if k.find("gate.weight") >= 0 and k.find(".mlp.") >= 0:
+                            # Find the corresponding gate conv from gate_convs by layer index
+                            for gate_op in gate_convs:
+                                gate_name = gate_op.get('name', '')
+                                if f'blocks.{index}/mlp/gate/MatMul' in gate_name:
+                                    load_convolution(gate_op, k, f, writer, quan)
+                                    break
                             continue
                         mlp_index = -1
                         for i in range(len(conv_names)):

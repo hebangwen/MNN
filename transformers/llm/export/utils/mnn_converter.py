@@ -2,8 +2,10 @@ import os
 import sys
 import copy
 import json
+import re
 import torch
 import numpy as np
+import safetensors
 
 from .torch_utils import quant as torch_quant
 from .torch_utils import onnx_export
@@ -273,6 +275,8 @@ class MNNConverter:
             for op in tqdm(mnn_graph['oplists'], 'Quant weights'):
                 if op['type'] == 'Extra' or op['type'] == 'LayerNorm':
                     new_ops += self.rebuild_op(op, mnn_graph)
+                elif op['type'] == 'Convolution' and 'gate/MatMul' in op.get('name', ''):
+                    new_ops += self.rebuild_gate_conv(op, mnn_graph)
                 else:
                     new_ops.append(op)
             mnn_graph['oplists'] = new_ops
@@ -282,6 +286,8 @@ class MNNConverter:
                     for op in subgraph['nodes']:
                         if op['type'] == 'Extra' or op['type'] == 'LayerNorm':
                             new_subops += self.rebuild_op(op, subgraph)
+                        elif op['type'] == 'Convolution' and 'gate/MatMul' in op.get('name', ''):
+                            new_subops += self.rebuild_gate_conv(op, subgraph)
                         else:
                             new_subops.append(op)
                     subgraph['nodes'] = new_subops
@@ -536,7 +542,7 @@ class MNNConverter:
         quant_block = self.args.lm_quant_block if is_lm else self.args.quant_block
         quant_sym = self.args.sym
 
-        if self.args.quant_config is not None:
+        if self.args.quant_config is not None and self.args.quant_config != "":
             with open(self.args.quant_config, 'r') as f:
                 quant_config = json.load(f)
             if name in quant_config:
@@ -666,3 +672,84 @@ class MNNConverter:
         if name.startswith('/expert/'):
             post_reshape['main']['dims'] = [-1, oc]
         return [pre_reshape, pre_convert, conv_op, post_convert, post_reshape]
+
+    def rebuild_gate_conv(self, op, graph):
+        """Quantize and load weights for MoE gate conv ops (loaded from safetensors)."""
+        name = op.get('name', '')
+        conv = op['main']
+        ic = conv['common']['inputCount']
+        oc = conv['common']['outputCount']
+
+        # Extract layer index from name: /blocks.{i}/mlp/gate/MatMul...
+        match = re.search(r'blocks\.(\d+)/mlp/gate', name)
+        if not match:
+            return [op]
+        layer_idx = int(match.group(1))
+
+        # Load gate weight from safetensors
+        model_path = self.exporter.args.path
+        safetensors_key = f'model.layers.{layer_idx}.mlp.gate.weight'
+
+        weight_tensor = None
+        for filename in sorted(os.listdir(model_path)):
+            if not filename.endswith('safetensors'):
+                continue
+            full_path = os.path.join(model_path, filename)
+            with safetensors.safe_open(full_path, framework='pt', device='cpu') as sf:
+                if safetensors_key in sf.keys():
+                    weight_tensor = sf.get_tensor(safetensors_key).float()
+                    break
+
+        if weight_tensor is None:
+            print(f'Warning: gate weight not found for layer {layer_idx}')
+            return [op]
+
+        weight_tensor = weight_tensor.reshape(oc, ic)
+        assert weight_tensor.shape == (oc, ic), f'Gate weight shape mismatch: {weight_tensor.shape} vs expected ({oc}, {ic})'
+
+        # Quantize
+        quant_bit = self.args.quant_bit
+        quant_block = self.args.quant_block
+        symmetric = self.args.sym
+
+        q_weight, alpha = self.quant(weight_tensor, quant_bit, quant_block, symmetric)
+        header_len, shape_int32 = self.write_header(ic, oc, quant_bit)
+        scale_fp16 = (self.args.scale_bit == 16)
+        alpha_dtype_size = 2 if scale_fp16 else 4
+
+        weight_len = self.write_weight(q_weight) + header_len
+        if scale_fp16:
+            alpha_np = alpha.numpy() if hasattr(alpha, 'numpy') else np.asarray(alpha)
+            alpha_fp16 = alpha_np.astype(np.float16)
+            alpha_len = self.write_weight(alpha_fp16)
+        else:
+            alpha_len = self.write_weight(alpha)
+
+        # No bias for gate conv
+        bias_len = 0
+        external = [self.mnn_weight_offset, weight_len, alpha_len, bias_len, 0]
+        self.mnn_weight_offset += (weight_len + alpha_len + bias_len)
+
+        q_min = 1
+        block_size = ic if quant_block == 0 else quant_block
+        if self.args.sym:
+            aMin = 0
+            readType = 0
+        else:
+            aMin = q_min
+            readType = oc * (ic // block_size)
+
+        quanParameter = {
+            'quantScale': 1.0, 'scaleIn': 0.0, 'scaleOut': 0.0,
+            'useInt32': False, 'has_scaleInt': False, 'shapeInt32': shape_int32,
+            'type': 1, 'aMaxOrBits': quant_bit, 'aMin': aMin, 'readType': readType, 'weightSize': 0,
+            'scaleStorage': 'FP16' if scale_fp16 else 'FP32',
+        }
+
+        # Remove inline weight, add external and quanParameter
+        if 'weight' in conv:
+            del conv['weight']
+        conv['external'] = external
+        conv['quanParameter'] = quanParameter
+
+        return [op]

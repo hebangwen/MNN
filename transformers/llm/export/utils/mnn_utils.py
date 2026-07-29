@@ -50,6 +50,7 @@ def load_mnn(filename):
     with open(filename) as f:
         mnn = json.load(f)
     conv_indexes = []
+    gate_conv_indexes = []
     layernorm_indexes = []
     blockops = []
     for op in mnn["oplists"]:
@@ -64,13 +65,17 @@ def load_mnn(filename):
             blockops.append(op)
             continue
         if op['type'] == 'Convolution':
-            conv_indexes.append(len(blockops))
+            name = op.get('name', '')
+            if 'gate/MatMul' in name:
+                gate_conv_indexes.append(len(blockops))
+            else:
+                conv_indexes.append(len(blockops))
             blockops.append(op)
     block = None
     blockes = []
     conv_order = ['attn_q', 'attn_k', 'attn_v', 'attn_output', 'ffn_gate', 'ffn_up', 'ffn_down']
     blockNumber = len(conv_indexes) // len(conv_order)
-    print("Layers number: ", blockNumber, ", conv number: ", len(conv_indexes), ", layernorm number:", len(layernorm_indexes))
+    print("Layers number: ", blockNumber, ", conv number: ", len(conv_indexes), ", gate convs: ", len(gate_conv_indexes), ", layernorm number:", len(layernorm_indexes))
     block_layernorms = len(layernorm_indexes) // blockNumber
     assert(len(layernorm_indexes) == block_layernorms * blockNumber + 1)
     for i in range(0, blockNumber):
@@ -84,6 +89,10 @@ def load_mnn(filename):
             index = layernorm_indexes[sta_layernorm + j]
             block.layernorm.append(blockops[index])
         blockes.append(block)
+    # Collect gate conv ops for access by safetensors2mnn
+    gate_convs = []
+    for idx in gate_conv_indexes:
+        gate_convs.append(blockops[idx])
     # Last layernorm and lm
     output_norm = blockops[layernorm_indexes[len(layernorm_indexes)-1]]
     lm = blockops[conv_indexes[len(conv_indexes)-1]]
@@ -108,7 +117,7 @@ def load_mnn(filename):
             convs.append(_block.conv[j])
     convs.append(lm)
 
-    return mnn, opmap, convs, blockes, block
+    return mnn, opmap, convs, blockes, block, gate_convs
 
 
 def write_quant_parameters(quant_bit, asymc, mnn_weight_file, ic, oc, weight_main, scalebias, mnn_weight_offset, need_scale_treat = True, scale_bit = 32):

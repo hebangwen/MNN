@@ -36,6 +36,7 @@ class Vision(torch.nn.Module):
         visual_models = {
             'deepseek-vl': DeepSeekVL,
             'unlimited-ocr': UnlimitedOcrVision,
+            'deepseek_vl_v2': DeepseekOcrVision,
             'internvl_chat': InternVLVision,
             'qwen': QwenVision,
             'qwen2_vl': Qwen2Vision,
@@ -425,6 +426,131 @@ class UnlimitedOcrVision(Vision):
             image_mask = (input_ids == self.image_pad_id)
             if image_mask.dim() > 1:
                 image_mask = image_mask.squeeze(0)       # (batch, seq) -> (seq,)
+            input_embeds[image_mask] = all_embeds
+        return input_embeds
+
+
+class DeepseekOcrVision(Vision):
+    """Vision encoder for DeepSeek-OCR-2 (deepseek_vl_v2).
+
+    Pipeline: SAM ViT-B -> flatten -> Qwen2Decoder2Encoder -> linear projector (896->1280).
+    For 1024x1024 global view: SAM outputs [1,896,16,16] -> n_query=256.
+    For 768x768 tiles: SAM outputs [1,896,12,12] -> n_query=144.
+    """
+    def __init__(self, visual, base):
+        # `visual` is the DeepseekOCR2Model, which owns sam_model / qwen2_model /
+        # projector / view_seperator.
+        # Set attributes needed by init_config BEFORE super().__init__
+        self.image_token_id = 128815  # <image>
+        self.image_pad_id = 128815
+        self.image_embeds = []
+        self.base_size = 1024
+        self.tile_size = 768
+        super().__init__(visual, base)
+        self.quant_bit = 8
+        self.sam_model = visual.sam_model
+        self.qwen2_model = visual.qwen2_model
+        self.projector = visual.projector
+        self.view_seperator = visual.view_seperator
+
+    def init_config(self):
+        self.llm_config['is_visual'] = True
+        # HF BasicImageTransform uses mean=std=(0.5,0.5,0.5) with ToTensor (0..1) + Normalize.
+        mean = [0.5 * 255.0, 0.5 * 255.0, 0.5 * 255.0]
+        std = [1.0 / 0.5 / 255.0, 1.0 / 0.5 / 255.0, 1.0 / 0.5 / 255.0]
+        self.llm_config['image_mean'] = mean
+        self.llm_config['image_norm'] = std
+        self.llm_config['image_pad'] = self.image_token_id
+        self.llm_config['image_size'] = self.base_size
+        self.llm_config['image_max_size'] = self.base_size
+
+    def load(self):
+        self.llm_config['is_visual'] = True
+        self.llm_config['image_size'] = self.base_size
+
+    def _encode(self, pixel_values):
+        # pixel_values: [B, 3, H, W]
+        # SAM forward -> [B, 896, H/64, W/64] (NCHW format)
+        sam_features = self.sam_model(pixel_values)  # [B, 896, H/64, W/64]
+        # Qwen2 encoder does its own flatten(2).transpose(1,2) internally
+        qwen_features = self.qwen2_model(sam_features)  # [B, N_out, 896]
+        # Projector: 896 -> 1280
+        features = self.projector(qwen_features)  # [B, N_out, 1280]
+        return features
+
+    def forward(self, patches, image_ori, crop_shape):
+        # patches: [P, 3, 768, 768] local tiles (P = width_crop_num * height_crop_num)
+        # image_ori: [1, 3, 1024, 1024] global view
+        # crop_shape: [width_crop_num, height_crop_num]
+        width_crop_num, height_crop_num = int(crop_shape[0]), int(crop_shape[1])
+
+        local_features = self._encode(patches)       # [P, N_local, 1280]
+        global_features = self._encode(image_ori)    # [1, N_global, 1280]
+
+        n_dim = local_features.shape[-1]
+
+        # Local: treat as [hc, wc, h2, w2, n_dim] -> [hc*h2, wc*w2, n_dim]
+        _, hw2, _ = local_features.shape
+        h2 = w2 = int(hw2 ** 0.5)
+        local_features = local_features.view(
+            height_crop_num, width_crop_num, h2, w2, n_dim
+        ).permute(0, 2, 1, 3, 4).reshape(height_crop_num * h2, width_crop_num * w2, n_dim)
+
+        # Flatten both to 2D [N, n_dim]
+        local_features = local_features.reshape(-1, n_dim)
+        global_features = global_features.reshape(-1, n_dim)
+
+        # Concatenate: local + global + separator
+        # Note: DeepSeek-OCR-2 places global view at the end
+        global_local_features = torch.cat(
+            [local_features, global_features, self.view_seperator[None, :]], dim=0
+        )
+        # MNN convention: (seq, batch, hidden)
+        global_local_features = global_local_features.unsqueeze(1)
+        return global_local_features
+
+    def export(self, onnx_path):
+        import torch.nn.functional as _F
+        import sys as _sys
+        # Patch SAM's get_abs_pos_sam to cache interpolated pos_embed at fixed sizes
+        _de = _sys.modules[type(self.sam_model).__module__]
+        _orig_get_abs_pos_sam = _de.get_abs_pos_sam
+        _sam_cache = {}
+
+        def _cached_get_abs_pos_sam(abs_pos, tgt_size):
+            key = int(tgt_size)
+            if key not in _sam_cache:
+                _sam_cache[key] = _orig_get_abs_pos_sam(abs_pos.detach().clone(), tgt_size).detach()
+            return _sam_cache[key]
+
+        _de.get_abs_pos_sam = _cached_get_abs_pos_sam
+
+        try:
+            P = 6  # 2x3 tile count for tracing
+            patches = torch.randn((P, 3, self.tile_size, self.tile_size), dtype=torch.float32)
+            image_ori = torch.randn((1, 3, self.base_size, self.base_size), dtype=torch.float32)
+            crop_shape = torch.tensor([2, 3], dtype=torch.long)
+            with torch.no_grad():
+                _ = self.forward(patches, image_ori, crop_shape)
+            onnx_model = f'{onnx_path}/visual.onnx'
+            onnx_export(self, (patches, image_ori, crop_shape),
+                        onnx_model,
+                        input_names=['dsocr_pixels', 'dsocr_global', 'dsocr_crop'],
+                        output_names=['image_embeds'])
+        finally:
+            _de.get_abs_pos_sam = _orig_get_abs_pos_sam
+        return onnx_model
+
+    def embed(self, input_ids, images=None, videos=None):
+        input_embeds = self.embed_(input_ids)
+        if self.image_embeds is not None and len(self.image_embeds) > 0:
+            all_embeds = torch.cat(self.image_embeds, dim=0)
+            all_embeds = all_embeds.reshape(-1, all_embeds.shape[-1]).to(input_embeds.dtype)
+            if input_embeds.dim() == 3:
+                input_embeds = input_embeds.squeeze(1)
+            image_mask = (input_ids == self.image_pad_id)
+            if image_mask.dim() > 1:
+                image_mask = image_mask.squeeze(0)
             input_embeds[image_mask] = all_embeds
         return input_embeds
 

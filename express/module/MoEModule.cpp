@@ -15,6 +15,19 @@
 namespace MNN {
 namespace Express {
 
+MoERoutingCallback MoEModule::sRoutingCallback = nullptr;
+std::string MoEModule::sDumpDir;
+std::set<int> MoEModule::sPrefillWritten;
+
+void MoEModule::setRoutingCallback(MoERoutingCallback cb) {
+    sRoutingCallback = cb;
+}
+
+void MoEModule::setDumpDir(const std::string& dir) {
+    sDumpDir = dir;
+    sPrefillWritten.clear();
+}
+
 std::vector<Express::VARP> MoEModule::onForward(const std::vector<Express::VARP>& inputs) {
     auto hiddenStates = inputs[0];
     auto routingWeights = inputs[1];
@@ -25,6 +38,57 @@ std::vector<Express::VARP> MoEModule::onForward(const std::vector<Express::VARP>
     const int topK   = selectedDim[ranks - 1];
     MNN_ASSERT(topK == mTopK);
     auto selectedPtr = selectedExperts->readMap<int>();
+    auto routingPtr = routingWeights->readMap<float>();
+    // Invoke routing callback (if set) for expert activation verification
+    if (sRoutingCallback) {
+        sRoutingCallback(mLayerId, mNumExperts, topK, seqlen, selectedPtr, routingPtr);
+    }
+    // File-based dump of ALL tokens for MoE routing verification
+    if (!sDumpDir.empty()) {
+        if (seqlen > 1) {
+            bool isFirstPrefill = sPrefillWritten.empty();
+            bool layerNeedsPrefill = sPrefillWritten.find(mLayerId) == sPrefillWritten.end();
+            if (layerNeedsPrefill) {
+                std::string expPath = sDumpDir + "/moe_layer_" + std::to_string(mLayerId) + "_prefill_experts.bin";
+                std::string wgtPath = sDumpDir + "/moe_layer_" + std::to_string(mLayerId) + "_prefill_weights.bin";
+                std::ofstream ef(expPath, std::ios::binary);
+                std::ofstream wf(wgtPath, std::ios::binary);
+                ef.write(reinterpret_cast<const char*>(selectedPtr), (std::streamsize)(seqlen * topK * sizeof(int)));
+                wf.write(reinterpret_cast<const char*>(routingPtr), (std::streamsize)(seqlen * topK * sizeof(float)));
+                sPrefillWritten.insert(mLayerId);
+                if (isFirstPrefill) {
+                    std::string metaPath = sDumpDir + "/moe_meta.json";
+                    std::ofstream mf(metaPath);
+                    mf << "{\"top_k\": " << topK
+                       << ", \"num_experts\": " << mNumExperts
+                       << ", \"layer_id\": " << mLayerId << "}";
+                }
+            }
+        } else if (sPrefillWritten.find(mLayerId) != sPrefillWritten.end()) {
+            std::string expPath = sDumpDir + "/moe_layer_" + std::to_string(mLayerId) + "_decode_experts.bin";
+            std::string wgtPath = sDumpDir + "/moe_layer_" + std::to_string(mLayerId) + "_decode_weights.bin";
+            std::ofstream ef(expPath, std::ios::binary | std::ios::app);
+            std::ofstream wf(wgtPath, std::ios::binary | std::ios::app);
+            ef.write(reinterpret_cast<const char*>(selectedPtr), (std::streamsize)(seqlen * topK * sizeof(int)));
+            wf.write(reinterpret_cast<const char*>(routingPtr), (std::streamsize)(seqlen * topK * sizeof(float)));
+        }
+    }
+#ifndef MNN_MOE_DEBUG_OFF
+    // DEBUG: Print expert routing
+    MNN_PRINT("[MoEDebug] layer=%d num_experts=%d topK=%d seqlen=%d\n", mLayerId, mNumExperts, topK, seqlen);
+    for (int t = 0; t < seqlen && t < 4; t++) {
+        MNN_PRINT("[MoEDebug]   token[%d]:", t);
+        for (int k = 0; k < topK; k++) {
+            int eid = selectedPtr[t * topK + k];
+            float w = routingPtr[t * topK + k];
+            MNN_PRINT(" expert=%d(%.4f)", eid, w);
+        }
+        MNN_PRINT("\n");
+    }
+    if (seqlen > 4) {
+        MNN_PRINT("[MoEDebug]   ... (%d more tokens)\n", seqlen - 4);
+    }
+#endif
     // decode
 #if 0 // using Expr for debug or clip some expert
     if (seqlen == 1) {
@@ -61,7 +125,6 @@ std::vector<Express::VARP> MoEModule::onForward(const std::vector<Express::VARP>
     }
 #endif
     // prefill
-    auto routingPtr  = routingWeights->readMap<float>();
     std::vector<std::vector<std::pair<int, float>>> expertWorks(mNumExperts, std::vector<std::pair<int, float>>());
     for (int i = 0; i < seqlen; ++i) {
         for (int j = 0; j < topK; ++j) {
@@ -135,6 +198,7 @@ MoEModule* MoEModule::create(const Op* op, const std::map<std::string, SubGraph>
     }
     module->mNumExperts  = numExperts;
     module->mTopK        = topK;
+    module->mLayerId     = layerId;
     for (int i = 0; i < numExperts; ++i) {
         std::string expertName = "/expert/" + std::to_string(layerId) + "_" + std::to_string(i);
         auto& expertG = subGraph.find(expertName)->second;
@@ -175,6 +239,7 @@ Module* MoEModule::clone(CloneContext* ctx) const {
     }
     module->mNumExperts = mNumExperts;
     module->mTopK = mTopK;
+    module->mLayerId = mLayerId;
     return this->cloneBaseTo(ctx, module);
 }
 

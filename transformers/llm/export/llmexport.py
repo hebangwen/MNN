@@ -92,7 +92,7 @@ class LlmExporter(torch.nn.Module):
             attn = self.model.blocks[0].self_attn
             if hasattr(attn, 'attn_scaling') and attn.attn_scaling != 1.0 / (self.config.head_dim ** 0.5):
                 self.llm_config['attn_scale'] = attn.attn_scaling
-        if self.config.sliding_window > 0:
+        if self.config.sliding_window is not None and self.config.sliding_window > 0:
             self.llm_config['sliding_window'] = self.config.sliding_window
         if hasattr(self.tokenizer, 'get_chat_template'):
              chat_template = self.tokenizer.get_chat_template()

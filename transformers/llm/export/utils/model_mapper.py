@@ -118,6 +118,43 @@ class ModelMapper:
         }
         self.regist('unlimited-ocr', unlimited_ocr_map)
 
+    def regist_deepseek_ocr2(self):
+        # DeepseekOCR2Config (cfg model_type 'deepseek_vl_v2', Python class attribute 'DeepseekOCR2')
+        # maps to the same unlimited-ocr architecture
+        unlimited_ocr_map = {
+            'config': {
+                'hidden_size': 'hidden_size',
+                'num_attention_heads': 'num_attention_heads',
+                'num_hidden_layers': 'num_hidden_layers',
+                'num_key_value_heads': 'num_key_value_heads',
+                'rope_theta': 'rope_theta',
+                'rope_scaling': 'rope_scaling',
+                'max_position_embeddings': 'max_position_embeddings',
+                'sliding_window': 'sliding_window',
+                'rms_norm_eps': 'rms_norm_eps',
+            },
+            'model': {
+                'lm': 'lm_head',
+                'embed': 'model.embed_tokens',
+                'blocks': 'model.layers',
+                'final_layernorm': 'model.norm',
+                'visual': 'model',
+            },
+            'decoder': self.default_decoder,
+            'attention': self.default_attention,
+            'mlp': {
+                'num_experts': 'gate.n_routed_experts',
+                'top_k': 'gate.top_k',
+                'norm_topk_prob': 'gate.norm_topk_prob',
+                'gate': 'gate',
+                'experts': 'experts',
+                'shared_experts': 'shared_experts',
+            },
+        }
+        # deepseek_vl_v2 is the config.json model_type for DeepSeek-OCR-2
+        # (DeepseekOCR2Config class attribute is 'DeepseekOCR2' but HF 5.x uses JSON value)
+        self.regist('deepseek_vl_v2', unlimited_ocr_map)
+
     def regist_qwen_omni(self):
         omni_map = {
             'config': {

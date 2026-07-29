@@ -55,6 +55,7 @@ class LlmModel(PreTrainedModel):
             'lfm2_vl': 'Lfm2VlForConditionalGeneration',
             'gemma4': 'Gemma4ForConditionalGeneration',
             'unlimited-ocr': 'UnlimitedOCRForCausalLM',
+            'deepseek_vl_v2': 'DeepseekOCR2ForCausalLM',
         }
         if model_type is None or model_type not in MODEL_CLASS_MAPPING:
             return AutoModelForCausalLM

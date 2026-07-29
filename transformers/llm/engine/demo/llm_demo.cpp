@@ -13,11 +13,73 @@
 #include <sstream>
 #include <stdlib.h>
 #include <initializer_list>
+#include <vector>
+#include <string>
+#if defined(LLM_SUPPORT_VISION) && defined(MNN_IMGCODECS)
+#include <cv/cv.hpp>
+#endif
 //#define LLM_SUPPORT_AUDIO
 #ifdef LLM_SUPPORT_AUDIO
 #include "audio/audio.hpp"
 #endif
 using namespace MNN::Transformer;
+
+// Callback to print activated experts per MoE layer
+// Registered via Llm::setMoERoutingCallback()
+static void expertRoutingCallback(int layerId, int numExperts, int topK,
+                                   int seqLen, const int* selected,
+                                   const float* weights) {
+    // Count expert usage across all tokens
+    std::vector<int> expertCounts(numExperts, 0);
+    for (int t = 0; t < seqLen; t++) {
+        for (int k = 0; k < topK; k++) {
+            int eid = selected[t * topK + k];
+            if (eid >= 0 && eid < numExperts) {
+                expertCounts[eid]++;
+            }
+        }
+    }
+    // Print layer summary
+    MNN_PRINT("[ExpertRouting] Layer %d: %d tokens, top-%d, %d experts\n",
+              layerId, seqLen, topK, numExperts);
+    // Find active experts and top-5 most used
+    int activeExperts = 0;
+    for (int i = 0; i < numExperts; i++) {
+        if (expertCounts[i] > 0) activeExperts++;
+    }
+    MNN_PRINT("[ExpertRouting]   Active: %d/%d experts", activeExperts, numExperts);
+    // Manual top-5 selection
+    int topIds[5] = {-1, -1, -1, -1, -1};
+    int topVals[5] = {0, 0, 0, 0, 0};
+    for (int i = 0; i < numExperts; i++) {
+        if (expertCounts[i] == 0) continue;
+        for (int j = 0; j < 5; j++) {
+            if (expertCounts[i] > topVals[j]) {
+                for (int k = 4; k > j; k--) {
+                    topIds[k] = topIds[k-1];
+                    topVals[k] = topVals[k-1];
+                }
+                topIds[j] = i;
+                topVals[j] = expertCounts[i];
+                break;
+            }
+        }
+    }
+    for (int i = 0; i < 5 && topIds[i] >= 0; i++) {
+        MNN_PRINT(" e%d:%d", topIds[i], topVals[i]);
+    }
+    MNN_PRINT("\n");
+    // Print per-token routing for first 4 tokens
+    for (int t = 0; t < seqLen && t < 4; t++) {
+        MNN_PRINT("[ExpertRouting]   token[%d]:", t);
+        for (int k = 0; k < topK; k++) {
+            int eid = selected[t * topK + k];
+            float w = weights[t * topK + k];
+            MNN_PRINT(" e%d(%.3f)", eid, w);
+        }
+        MNN_PRINT("\n");
+    }
+}
 
 static void tuning_prepare(Llm* llm) {
     MNN_PRINT("Prepare for tuning opt Begin\n");
@@ -262,16 +324,124 @@ void chat(Llm* llm) {
         messages.emplace_back("assistant", assistant_str);
     }
 }
+
+static void dumpOutputTensors(Llm* llm, const std::string& dump_dir) {
+    auto outputs = llm->getOutputs();
+    if (outputs.empty()) {
+        MNN_PRINT("[dump] No output tensors to dump\n");
+        return;
+    }
+    int logitsIdx = llm->getOutputIndex("logits");
+    int hiddenIdx = llm->getOutputIndex("hidden_states");
+    std::ofstream metaFile(dump_dir + "/mnn_meta.json");
+    metaFile << "{\n";
+    bool first = true;
+    auto dumpOne = [&](const std::string& name, int idx) -> void {
+        if (idx < 0 || idx >= (int)outputs.size()) return;
+        auto& v = outputs[idx];
+        auto info = v->getInfo();
+        if (!info) return;
+        auto ptr = v->readMap<float>();
+        if (!ptr) return;
+        std::ofstream f(dump_dir + "/" + name + ".bin", std::ios::binary);
+        f.write(reinterpret_cast<const char*>(ptr),
+                (std::streamsize)(info->size * sizeof(float)));
+        if (!first) metaFile << ",\n";
+        metaFile << "  \"" << name << "_shape\": [";
+        for (int i = 0; i < (int)info->dim.size(); i++) {
+            if (i > 0) metaFile << ", ";
+            metaFile << info->dim[i];
+        }
+        metaFile << "]";
+        first = false;
+    };
+    dumpOne("logits", logitsIdx);
+    dumpOne("hidden_states", hiddenIdx);
+    metaFile << ",\n  \"note\": \"Outputs captured from last forward via getOutputs()\"\n}\n";
+    MNN_PRINT("[dump] Output tensors written to %s\n", dump_dir.c_str());
+}
+
+static int runMultimodal(Llm* llm, const std::string& image_path,
+                         const std::string& dump_dir, int max_token_number) {
+#if defined(LLM_SUPPORT_VISION) && defined(MNN_IMGCODECS)
+    MNN::Express::VARP image = MNN::CV::imread(image_path);
+    if (image == nullptr) {
+        MNN_ERROR("Failed to load image: %s\n", image_path.c_str());
+        return -1;
+    }
+    MNN_PRINT("Loaded image: %s\n", image_path.c_str());
+    MultimodalPrompt mp;
+    mp.prompt_template = "<img>image</img>document parsing.";
+    PromptImagePart imgPart;
+    imgPart.image_data = image;
+    imgPart.width = 0;
+    imgPart.height = 0;
+    mp.images["image"] = imgPart;
+    llm->set_config(R"({"async":false})");
+    auto context = llm->getContext();
+    if (max_token_number > 0) {
+        llm->response(mp, &std::cout, nullptr, 0);
+        if (!dump_dir.empty()) {
+            dumpOutputTensors(llm, dump_dir);
+        }
+        while (!llm->stoped() && context->gen_seq_len < max_token_number) {
+            llm->generate(1);
+            if (context->status == LlmStatus::INTERNAL_ERROR) {
+                MNN_ERROR("Error: Generation failed due to internal error\n");
+                return -1;
+            }
+        }
+    } else {
+        llm->response(mp);
+        if (context->status == LlmStatus::INTERNAL_ERROR) {
+            MNN_ERROR("Error: Response generation failed due to internal error\n");
+            return -1;
+        }
+        if (!dump_dir.empty()) {
+            dumpOutputTensors(llm, dump_dir);
+        }
+    }
+    return 0;
+#else
+    (void)llm;
+    (void)max_token_number;
+    MNN_ERROR("Image loading not supported (need MNN_BUILD_OPENCV=ON and MNN_IMGCODECS=ON): %s\n",
+              image_path.c_str());
+    return -1;
+#endif
+}
 int main(int argc, const char* argv[]) {
-    if (argc < 2) {
-        std::cout << "Usage: " << argv[0] << " config.json <prompt.txt>" << std::endl;
+    std::string image_path, dump_dir;
+    int max_token_number = -1;
+    std::vector<std::string> positional_args;
+    for (int i = 1; i < argc; i++) {
+        std::string arg = argv[i];
+        if (arg == "--image" && i + 1 < argc) {
+            image_path = argv[++i];
+        } else if (arg == "--dump_dir" && i + 1 < argc) {
+            dump_dir = argv[++i];
+        } else if (arg == "--max_tokens" && i + 1 < argc) {
+            max_token_number = std::stoi(argv[++i]);
+        } else {
+            positional_args.push_back(arg);
+        }
+    }
+
+    if (positional_args.empty()) {
+        std::cout << "Usage: " << argv[0] << " config.json <prompt.txt> [max_tokens]\n"
+                  << "  --image <path>      Path to image file (multimodal input)\n"
+                  << "  --dump_dir <path>   Directory for MoE + tensor dumps\n"
+                  << "  --max_tokens <N>    Max tokens to generate\n";
         return 0;
     }
 
-    std::string config_path = argv[1];
+    std::string config_path = positional_args[0];
     std::cout << "config path is " << config_path << std::endl;
     std::unique_ptr<Llm> llm(Llm::createLLM(config_path));
     llm->set_config("{\"tmp_path\":\"tmp\"}");
+    if (!dump_dir.empty()) {
+        Llm::setMoEDumpDir(dump_dir);
+    }
     {
         AUTOTIME;
         bool res = llm->load();
@@ -280,20 +450,24 @@ int main(int argc, const char* argv[]) {
             return 0;
         }
     }
-    if (true) {
+    // Register MoE expert routing callback for vision verification
+    Llm::setMoERoutingCallback(expertRoutingCallback);
+    if (dump_dir.empty()) {
         AUTOTIME;
         tuning_prepare(llm.get());
     }
-    if (argc < 3) {
+    if (!image_path.empty()) {
+        return runMultimodal(llm.get(), image_path, dump_dir, max_token_number);
+    }
+    if (positional_args.size() < 2) {
         chat(llm.get());
         return 0;
     }
-    int max_token_number = -1;
-    if (argc >= 4) {
-        std::istringstream os(argv[3]);
+    if (max_token_number < 0 && positional_args.size() >= 3) {
+        std::istringstream os(positional_args[2]);
         os >> max_token_number;
     }
-    if (argc >= 5) {
+    if (positional_args.size() >= 4) {
         MNN_PRINT("Set not thinking, only valid for Qwen3\n");
         llm->set_config(R"({
             "jinja": {
@@ -303,7 +477,7 @@ int main(int argc, const char* argv[]) {
             }
         })");
     }
-    std::string prompt_file = argv[2];
+    std::string prompt_file = positional_args[1];
     llm->set_config(R"({
         "async":false
     })");

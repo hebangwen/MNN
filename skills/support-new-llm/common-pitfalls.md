@@ -471,3 +471,73 @@ elif model_type == 'lfm2_audio':
 - 非标准加载的模型**权重路径可能不同**于标准 HF 模型，需要通过 `print(original_model)` 或 `state_dict().keys()` 确认实际路径
 - 嵌套的 config 结构可能需要在 `config.py` 的 `from_pretrained` 中手动提取子配置
 - 某些包的注意力实现默认使用 `flash_attention_2`，CPU 上需要手动切换为 `sdpa` 或 `eager`
+
+---
+
+## 58. 多模态预处理与 HF 不一致（ImageOps.pad / PIL bicubic）
+
+### 问题描述
+
+C++ 复现 HF 图像预处理时，两个隐蔽偏差会让 vision features 余弦掉到 0.8 以下（即使 encoder 完全正确），进而导致 MoE routing 大面积不一致、OCR 坐标系统性漂移（如 y 坐标整体偏移且 x 精确）。
+
+### 判断方法
+
+- dump C++ vision features 与 HF `masked_scatter_` 的 source（[num_tokens, 1280]）逐 token 比余弦；含常量向量的段（image_newline/view_seperator）应为 1.0，作为对齐基准
+- **ImageOps.pad 语义**：先按比例缩放使图像 *放入* 目标尺寸（`ImageOps.contain`，小图会 *放大*），再居中 padding；不是"原尺寸直接 padding"
+- **PIL `Image.resize` 默认 BICUBIC 是 Keys a=-0.5 kernel；OpenCV `INTER_CUBIC` 是 a=-0.75**，在放大（如 557×774→1920×2560）上差异显著；PIL 重采样输出还会量化到 uint8
+
+### 解决方案
+
+- contain 缩放：`scale=min(base/W, base/H)`，`lround` 后 resize，再居中 pad（归一化后 mean 色=0，pad 0 即可）
+- 在 C++ 实现 PIL 等价 bicubic（a=-0.5，support 2，可分离，边缘 clamp，权重归一），输出四舍五入到 uint8 再归一化
+- 验收标准：vision features 与 HF 的余弦均值 ≥ 0.98，而不是"看起来差不多"
+
+---
+
+## 59. 输出全 NaN 时先怀疑运行时残留调试代码，而不是导出
+
+### 问题描述
+
+routing weights / hidden states 全 NaN、logits 半数 NaN（另一半 -FLT_MAX 是 sampler mask），容易误判为"量化把模型导坏了"。
+
+### 判断方法
+
+- `git status`/`git diff` 检查 `source/backend/cpu/**` 是否有未提交的内核改动（如调试时把向量化的带 clamp exp 换成裸 `expf`）
+- 用干净运行时（git stash 后重编）跑同一模型：若 NaN 消失 → 运行时问题；仍在 → 导出问题
+- routing 权重恒为 NaN 且专家集合恒定，说明 gate *输入* 已含 NaN（上游 attention/vision 传播），不一定是 gate 本身
+- 对照特征：MoE gate 权重全零（检查导出 JSON 中 gate conv 的 inline weight 是否全 0）表现为专家集合恒定但权重为均匀分布而非 NaN
+
+---
+
+## 60. 数值对齐验证要用 fp32 计算，部署配置单独验证 e2e
+
+### 问题描述
+
+同一 int8 模型，`precision=low`（fp16 计算）下 MoE routing within_1 只有 84%，`precision=high`（fp32）下达 96% —— 差异全部来自 fp16 计算误差在 12 层 × 1517 token 上的累积，与权重量化无关。若用 fp16 结果下结论会误判量化不合格。
+
+### 解决方案
+
+- 数值验证（routing 一致性、logits/hidden 余弦）：`config.json` 设 `precision: "high"` + `memory: "normal"`
+- 部署验证（e2e 文本质量）：恢复 `precision: "low"` + `memory: "low"` 单独跑
+- logits 对比注意对齐：MNN 导出图 `logits_index=[-1]` 只输出末位，dump 时机在 prefill 后（`response()` 返回、`generate()` 前），与 HF prefill 最后一行对齐
+- `hidden_states` 输出需 config 里 `"hidden_states": true` 才暴露；导出图本身恒定包含该输出（也被 logits_index 截到末位）
+
+---
+
+## 61. 多模态归因：dump+inject 配对做分解实验
+
+### 问题描述
+
+"LLM 前向坏了"还是"vision 坏了"在多轮 debug 中容易反复横跳、长期停滞。
+
+### 解决方案
+
+在 vision 处理函数中放一对 env 开关：`UOCR_DUMP_VISION`（写出 MNN vision features）与 `UOCR_INJECT_VISION`（读入参考 features 替代 MNN 前向）。三个余弦即可归因：
+
+1. inject(参考) → 全链路一致 ⇒ LLM 前向忠实，嫌疑锁定 vision
+2. MNN encoder 吃 PIL 精确预处理输入 vs HF features ⇒ encoder 保真度（隔离预处理）
+3. dump(MNN 自产预处理) vs HF features ⇒ 预处理保真度
+
+### 环境注意
+
+`conda run` 不带 `-n` 会用 base env（无 torch → segfault/OMP 报错）；直接用目标 env 的 python 绝对路径（如 `.../envs/dpskocr/bin/python3`）。

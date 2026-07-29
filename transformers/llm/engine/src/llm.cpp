@@ -25,6 +25,7 @@
 #include "omni.hpp"
 #include "speculative_decoding/generate.hpp"
 #include "core/MNNFileUtils.h"
+#include "module/MoEModule.hpp"
 
 // 0: no debug, 1: test op time, 2: print tensor info, 3: print tensor in output
 #define DEBUG_MODE 0
@@ -153,6 +154,25 @@ bool Llm::set_config(const std::string& content) {
 
 void Llm::setDebugCallback(MNN::TensorCallBackWithInfo&& before, MNN::TensorCallBackWithInfo&& after) {
     mExecutor->setCallBack(std::move(before), std::move(after));
+}
+
+void Llm::setMoERoutingCallback(void (*cb)(int, int, int, int, const int*, const float*)) {
+    using MNN::Express::MoEModule;
+    if (cb) {
+        MoEModule::setRoutingCallback(cb);
+        MNN_PRINT("[MoE] Expert routing callback registered. MoE layer debug enabled.\n");
+    } else {
+        MoEModule::setRoutingCallback(nullptr);
+        MNN_PRINT("[MoE] Expert routing callback cleared.\n");
+    }
+}
+
+void Llm::setMoEDumpDir(const std::string& dir) {
+    using MNN::Express::MoEModule;
+    MoEModule::setDumpDir(dir);
+    if (!dir.empty()) {
+        MNN_PRINT("[MoE] Dump directory set to: %s\n", dir.c_str());
+    }
 }
 
 void Llm::setRuntimeHint(std::shared_ptr<Express::Executor::RuntimeManager> &rtg, bool mllm) {

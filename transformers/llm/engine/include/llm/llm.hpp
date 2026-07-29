@@ -179,6 +179,15 @@ public:
     bool set_config(const std::string& content);
     void setDebugCallback(MNN::TensorCallBackWithInfo&& before, MNN::TensorCallBackWithInfo&& after);
     Llm* create_lora(const std::string& lora_path);
+    // Set a global callback for MoE expert routing debug.
+    // Invoked for every MoE layer's forward, with layer info and per-token expert selections.
+    // Use this to verify vision MoE activation across layers.
+    // Pass nullptr to clear.
+    // Note: MoE callback is global; affects all MNN inference, not just this Llm instance.
+    static void setMoERoutingCallback(void (*cb)(int layerId, int numExperts, int topK,
+                                                  int seqLen, const int* selectedExperts,
+                                                  const float* routingWeights));
+    static void setMoEDumpDir(const std::string& dir);
     // tokenier function
     bool is_stop(int token);
     std::string tokenizer_decode(int token);

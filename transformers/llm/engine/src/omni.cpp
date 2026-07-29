@@ -589,6 +589,97 @@ std::vector<int> Omni::smolvlmVisionProcess(VARP image) {
     return imgIds;
 }
 
+// PIL-compatible bicubic resampling (Keys cubic a=-0.5, support 2, separable, edge-clamped,
+// per-output weights renormalized). Matches PIL Image.resize(..., BICUBIC). MNN::CV::INTER_CUBIC
+// uses a=-0.75 which measurably shifts vision features on the 1.3x/3.4x upscales used here.
+static float uocrPilCubicWeight(float x) {
+    const float a = -0.5f;
+    if (x < 0.0f) x = -x;
+    if (x < 1.0f) return ((a + 2.0f) * x - (a + 3.0f)) * x * x + 1.0f;
+    if (x < 2.0f) return (((x - 5.0f) * x + 8.0f) * x - 4.0f) * a;
+    return 0.0f;
+}
+
+static void uocrPilResizeAxis(const float* in, int inN, int inStride, float* out, int outN, int outStride, int inner) {
+    float scale = (float)inN / (float)outN;
+    float fscale = scale < 1.0f ? 1.0f : scale;
+    float support = 2.0f * fscale;
+    float ss = 1.0f / fscale;
+    std::vector<float> w;
+    for (int o = 0; o < outN; ++o) {
+        float center = (o + 0.5f) * scale;
+        int xmin = (int)(center - support + 0.5f);
+        if (xmin < 0) xmin = 0;
+        int xmax = (int)(center + support + 0.5f);
+        if (xmax > inN) xmax = inN;
+        w.assign(xmax - xmin, 0.0f);
+        float wsum = 0.0f;
+        for (int x = xmin; x < xmax; ++x) {
+            w[x - xmin] = uocrPilCubicWeight((x - center + 0.5f) * ss);
+            wsum += w[x - xmin];
+        }
+        if (wsum == 0.0f) { wsum = 1.0f; }
+        for (int ch = 0; ch < inner; ++ch) {
+            float acc = 0.0f;
+            for (int x = xmin; x < xmax; ++x) {
+                acc += in[(size_t)x * inStride + ch] * w[x - xmin];
+            }
+            out[(size_t)o * outStride + ch] = acc / wsum;
+        }
+    }
+}
+
+// [sh, sw, c] -> [dh, dw, c], float32, PIL bicubic
+static void uocrPilResizeBicubic(const float* src, int sw, int sh, float* dst, int dw, int dh, int c) {
+    std::vector<float> tmp((size_t)sh * dw * c);
+    for (int y = 0; y < sh; ++y) {
+        uocrPilResizeAxis(src + (size_t)y * sw * c, sw, c, tmp.data() + (size_t)y * dw * c, dw, c, c);
+    }
+    for (int x = 0; x < dw * c; ++x) {
+        // vertical axis: elements strided by dw*c; inner=1 per column element
+        float scale = (float)sh / (float)dh;
+        float fscale = scale < 1.0f ? 1.0f : scale;
+        float support = 2.0f * fscale;
+        float ss = 1.0f / fscale;
+        std::vector<float> w;
+        for (int o = 0; o < dh; ++o) {
+            float center = (o + 0.5f) * scale;
+            int ymin = (int)(center - support + 0.5f);
+            if (ymin < 0) ymin = 0;
+            int ymax = (int)(center + support + 0.5f);
+            if (ymax > sh) ymax = sh;
+            w.assign(ymax - ymin, 0.0f);
+            float wsum = 0.0f;
+            for (int y = ymin; y < ymax; ++y) {
+                w[y - ymin] = uocrPilCubicWeight((y - center + 0.5f) * ss);
+                wsum += w[y - ymin];
+            }
+            if (wsum == 0.0f) { wsum = 1.0f; }
+            float acc = 0.0f;
+            for (int y = ymin; y < ymax; ++y) {
+                acc += tmp[(size_t)y * dw * c + x] * w[y - ymin];
+            }
+            dst[(size_t)o * dw * c + x] = acc / wsum;
+        }
+    }
+}
+
+// HWC BGR float -> NCHW normalized RGB VARP: out = (rgb - mean) * normVal
+static VARP uocrHwcToNormNchw(const std::vector<float>& hwc, int w, int h, int c,
+                              const std::vector<float>& mean, const std::vector<float>& normVal) {
+    auto v = _Input({1, c, h, w}, NCHW, halide_type_of<float>());
+    auto ptr = v->writeMap<float>();
+    for (int ch = 0; ch < c; ++ch) {
+        int srcCh = (ch == 0) ? 2 : (ch == 2) ? 0 : ch;
+        for (int p = 0; p < w * h; ++p) {
+            float px = std::round(hwc[(size_t)p * c + srcCh]);   // PIL resample outputs uint8
+            ptr[(size_t)ch * w * h + p] = (px - mean[ch]) * normVal[ch];
+        }
+    }
+    v->unMap();
+    return v;
+}
+
 // Gundam 2D tiling (HF modeling_unlimitedocr.dynamic_preprocess): pick the (i,j) tile grid of
 // `tile_size` squares whose aspect ratio is closest to the image's, with i*j in [min_num, max_num].
 static std::pair<int, int> unlimitedOcrCropRatio(int width, int height, int tile_size,
@@ -644,31 +735,33 @@ std::vector<int> Omni::unlimitedOcrVisionProcess(VARP image) {
         wc = cr.first; hc = cr.second;
     }
     int num_tiles = wc * hc;
-    // Global view: HF uses ImageOps.pad — the ORIGINAL image (no resize) centered in a
-    // base_size x base_size canvas filled with the mean color. Reproduce: normalize the original
-    // image (no resize), then _Pad centered to base_size. After mean/norm, the mean color maps
-    // to 0, so padding with 0 == padding with the mean color.
-    auto globalImage = MNN::CV::resize(image, {img_w, img_h}, 0, 0,
-                                       MNN::CV::INTER_LINEAR, MNN::CV::COLOR_BGR2RGB,
-                                       mVisionMean, mVisionNorm);
-    globalImage = Express::_Unsqueeze(globalImage, {0});
-    globalImage = Express::_Convert(globalImage, NCHW);   // [1, 3, img_h, img_w]
-    int pad_top = (base_size - img_h) / 2;
-    int pad_bottom = base_size - img_h - pad_top;
-    int pad_left = (base_size - img_w) / 2;
-    int pad_right = base_size - img_w - pad_left;
+    // Global view: HF uses ImageOps.pad — ImageOps.contain (aspect-preserving resize so the
+    // image FITS base_size x base_size, upscaling small images) then center-pad to base_size
+    // with the mean color. Reproduce contain with an explicit scale, then _Pad centered.
+    // After mean/norm, the mean color maps to 0, so padding with 0 == padding with the mean color.
+    // ImageOps.pad resamples with BICUBIC by default; use INTER_CUBIC to match.
+    float containScale = std::min((float)base_size / (float)img_w, (float)base_size / (float)img_h);
+    int containW = std::max(1, (int)std::lround(img_w * containScale));
+    int containH = std::max(1, (int)std::lround(img_h * containScale));
+    auto imgNhwc = Express::_Convert(image, NHWC);
+    imgNhwc = Express::_Cast<float>(imgNhwc);
+    auto imgPtr = imgNhwc->readMap<float>();
+    int imgC = (imgInfo != nullptr && imgInfo->dim.size() >= 3) ? imgInfo->dim[2] : 3;
+    std::vector<float> gbuf((size_t)containW * containH * imgC);
+    uocrPilResizeBicubic(imgPtr, img_w, img_h, gbuf.data(), containW, containH, imgC);
+    auto globalImage = uocrHwcToNormNchw(gbuf, containW, containH, imgC, mVisionMean, mVisionNorm);
+    int pad_top = (base_size - containH) / 2;
+    int pad_bottom = base_size - containH - pad_top;
+    int pad_left = (base_size - containW) / 2;
+    int pad_right = base_size - containW - pad_left;
     globalImage = Express::_Pad(globalImage,
                                 _var<int>({0, 0, 0, 0, pad_top, pad_bottom, pad_left, pad_right}, {8}),
                                 Express::CONSTANT);
 
-    // Local tiles: resize the image to (tile_size*wc) x (tile_size*hc), then split into the grid.
-    // HF dynamic_preprocess uses PIL Image.resize() which defaults to BICUBIC; use INTER_CUBIC
-    // to match (INTER_LINEAR produced a ~3.4x upscale that diverged from HF, corrupting OCR).
-    auto tiled = MNN::CV::resize(image, {tile_size * wc, tile_size * hc}, 0, 0,
-                                 MNN::CV::INTER_CUBIC, MNN::CV::COLOR_BGR2RGB,
-                                 mVisionMean, mVisionNorm);
-    tiled = Express::_Unsqueeze(tiled, {0});
-    tiled = Express::_Convert(tiled, NCHW);
+    int fullW = tile_size * wc, fullH = tile_size * hc;
+    std::vector<float> tbuf((size_t)fullW * fullH * imgC);
+    uocrPilResizeBicubic(imgPtr, img_w, img_h, tbuf.data(), fullW, fullH, imgC);
+    auto tiled = uocrHwcToNormNchw(tbuf, fullW, fullH, imgC, mVisionMean, mVisionNorm);
     // [1, 3, tile*hc, tile*wc] -> [num_tiles, 3, tile, tile]
     tiled = Express::_Reshape(tiled, {1, 3, hc, tile_size, wc, tile_size});
     tiled = Express::_Permute(tiled, {0, 2, 4, 1, 3, 5});
@@ -679,6 +772,34 @@ std::vector<int> Omni::unlimitedOcrVisionProcess(VARP image) {
     auto cropPtr = cropShape->writeMap<int>();
     cropPtr[0] = wc; cropPtr[1] = hc;
     cropShape->unMap();
+
+    const char* tiledBin = std::getenv("UOCR_TILED_BIN");
+    const char* globalBin = std::getenv("UOCR_GLOBAL_BIN");
+    if (tiledBin != nullptr && globalBin != nullptr) {
+        auto loadF32 = [](const char* path, std::vector<int> dims) -> VARP {
+            FILE* fp = std::fopen(path, "rb");
+            if (fp == nullptr) {
+                return nullptr;
+            }
+            std::fseek(fp, 0, SEEK_END);
+            long fsize = std::ftell(fp);
+            std::fseek(fp, 0, SEEK_SET);
+            auto v = _Input(dims, NCHW, halide_type_of<float>());
+            auto ptr = v->writeMap<float>();
+            size_t nread = std::fread(ptr, 1, fsize, fp);
+            std::fclose(fp);
+            v->unMap();
+            MNN_PRINT("[uocr] BIN INPUT: %s -> %zu bytes\n", path, nread);
+            return v;
+        };
+        auto t = loadF32(tiledBin, {num_tiles, 3, tile_size, tile_size});
+        auto g = loadF32(globalBin, {1, 3, base_size, base_size});
+        if (nullptr != t && nullptr != g) {
+            tiled = t;
+            globalImage = g;
+            MNN_PRINT("[uocr] BIN INPUT MODE: using precomputed tiled/global inputs\n");
+        }
+    }
 
     // Forward the exported vision module: [num_tiles,3,640,640], [1,3,1024,1024], [2] -> [1513,1,1280]
     // The output is in HF forward() order: [local 1240, global 272, view_seperator 1] = 1513.
@@ -716,6 +837,22 @@ std::vector<int> Omni::unlimitedOcrVisionProcess(VARP image) {
         imageEmbedding = outputs[0];
         auto dims = imageEmbedding->getInfo()->dim;
         totalTokens = dims[0];   // 1513 for 3x4
+    }
+    const char* dumpPath = std::getenv("UOCR_DUMP_VISION");
+    if (dumpPath != nullptr && nullptr != imageEmbedding) {
+        auto embNchw = _Convert(imageEmbedding, NCHW);
+        auto info = embNchw->getInfo();
+        size_t n = 1;
+        for (auto d : info->dim) {
+            n *= (size_t)d;
+        }
+        auto ptr = embNchw->readMap<float>();
+        FILE* fp = std::fopen(dumpPath, "wb");
+        if (fp != nullptr) {
+            std::fwrite(ptr, sizeof(float), n, fp);
+            std::fclose(fp);
+            MNN_PRINT("[uocr] DUMP VISION: wrote %zu floats to %s\n", n, dumpPath);
+        }
     }
 
     // Omni::embedding consumes ONE mVisionEmbeddings block per contiguous mVisionPad run (it emits
